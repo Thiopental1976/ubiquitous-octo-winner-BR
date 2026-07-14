@@ -365,26 +365,41 @@ def test_fd_merge_single_pass():
 
 # ------------------------------------------------------------------ opt#2 trava SMR /mnt
 def test_mnt_serializes():
-    """Opt#2: em /mnt (e /media, /run/media) a busca SERIALIZA (1 worker) —
-    poupa SMR de seek concorrente. Fora dali, usa o pool cheio."""
+    """Opt#2 + refinamento v3: sob /mnt (etc.) serializa se o disco for ROTACIONAL
+    ou DESCONHECIDO; um SSD/NVMe confirmado (rotational=0) paraleliza mesmo sob /mnt.
+    Fora de /mnt, sempre paraleliza. Mocka a leitura de sysfs p/ ser determinístico."""
     old = boolean._WORKERS
+    old_dev, old_rot = boolean._dev_for_path, boolean._rotational
     boolean._WORKERS = 3
+    # Mapa fake: caminho -> nó de dispositivo -> rotacional. "" = disco desconhecido.
+    devs = {"/mnt/smr/x": "/dev/sdb1", "/mnt/ssd/x": "/dev/sdc1", "/mnt": "/dev/sdb1"}
+    rot = {"/dev/sdb1": "1", "/dev/sdc1": "0"}       # sdb=HDD/SMR, sdc=SSD
+    boolean._dev_for_path = lambda ap: devs.get(ap, "")
+    boolean._rotational = lambda dev: rot.get(dev)   # None = desconhecido
     try:
-        assert boolean._max_workers(Query(paths=["/mnt/DiscoL/x"])) == 1, "não serializou em /mnt"
-        assert boolean._max_workers(Query(paths=["/media/rodrigo/HD"])) == 1, "não serializou em /media"
-        assert boolean._max_workers(Query(paths=["/run/media/rodrigo/HD"])) == 1, "não serializou em /run/media"
-        assert boolean._max_workers(Query(paths=["/mnt"])) == 1, "não serializou no próprio /mnt"
-        assert boolean._max_workers(Query(paths=[os.path.expanduser("~")])) == 3, "devia paralelizar no ~"
-        assert boolean._max_workers(Query(paths=["/tmp"])) == 3, "devia paralelizar no /tmp"
-        # /mntx NÃO é /mnt: só casa o componente inteiro de caminho
-        assert boolean._max_workers(Query(paths=["/mntx/foo"])) == 3, "casou /mnt por prefixo solto"
-        # basta UM caminho em /mnt p/ serializar tudo (cabeças do MESMO disco brigam)
-        assert boolean._max_workers(Query(paths=["/tmp", "/mnt/DiscoL"])) == 1, "misto não serializou"
+        mw = lambda p: boolean._max_workers(Query(paths=p if isinstance(p, list) else [p]))
+        # rotacional sob /mnt -> serializa
+        assert mw("/mnt/smr/x") == 1, "rotacional em /mnt devia serializar"
+        assert mw("/mnt") == 1, "rotacional no próprio /mnt devia serializar"
+        # SSD confirmado sob /mnt -> paraleliza (refinamento v3)
+        assert mw("/mnt/ssd/x") == 3, "SSD em /mnt NÃO devia serializar"
+        # disco desconhecido sob /mnt -> padrão seguro: serializa
+        assert mw("/mnt/desconhecido/x") == 1, "desconhecido em /mnt devia serializar"
+        assert mw("/media/rodrigo/HD") == 1, "desconhecido em /media devia serializar"
+        assert mw("/run/media/rodrigo/HD") == 1, "desconhecido em /run/media devia serializar"
+        # fora de /mnt -> sempre paraleliza (nem consulta sysfs)
+        assert mw(os.path.expanduser("~")) == 3, "devia paralelizar no ~"
+        assert mw("/tmp") == 3, "devia paralelizar no /tmp"
+        assert mw("/mntx/foo") == 3, "casou /mnt por prefixo solto"
+        # misto: rotacional em /mnt arrasta tudo p/ serial; SSD em /mnt não
+        assert mw(["/tmp", "/mnt/smr/x"]) == 1, "misto c/ rotacional devia serializar"
+        assert mw(["/tmp", "/mnt/ssd/x"]) == 3, "misto só c/ SSD não devia serializar"
         boolean._WORKERS = 1
-        assert boolean._max_workers(Query(paths=["/tmp"])) == 1, "WORKERS=1 devia serializar sempre"
-        print("ok  opt#2  trava SMR: serializa em /mnt|/media|/run/media, paraleliza fora")
+        assert mw("/tmp") == 1, "WORKERS=1 devia serializar sempre"
+        print("ok  opt#2  trava SMR c/ rotational: rotacional/desconhecido serializa, SSD libera")
     finally:
         boolean._WORKERS = old
+        boolean._dev_for_path, boolean._rotational = old_dev, old_rot
 
 
 def test_or_parallel_correctness():

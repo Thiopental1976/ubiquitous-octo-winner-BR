@@ -494,11 +494,21 @@ então rodam em paralelo num `ThreadPoolExecutor` — mas **só quando o disco a
 - **Onde**: `boolean._eval` ganhou o parâmetro `pool`; o ramo `Or` achata a cadeia
   (`_or_operands`) e faz `pool.submit` de cada operando. `search_boolean` cria o pool
   só quando `_max_workers(q) > 1`.
-- **Trava SMR** (`_max_workers` + `_under_mount`): se **qualquer** path da busca estiver
-  sob `/mnt`, `/media` ou `/run/media`, retorna **1 worker** (serial) — as cabeças do
-  mesmo disco brigariam por *seek*. Fora dali (`~`, `/tmp`, SSD), usa `_WORKERS` (3 por
-  padrão, afinável por `LFS_WORKERS`). O casamento é por **componente inteiro** de
-  caminho, então `/mntx` não conta como `/mnt`.
+- **Trava SMR** (`_max_workers` + `_path_needs_serial`): se **qualquer** path da busca
+  estiver sob `/mnt`, `/media` ou `/run/media` **sobre um disco rotacional ou
+  desconhecido**, retorna **1 worker** (serial) — as cabeças do mesmo disco brigariam
+  por *seek*. Fora dali (`~`, `/tmp`, SSD), usa `_WORKERS` (3 por padrão, afinável por
+  `LFS_WORKERS`). O casamento é por **componente inteiro** de caminho, então `/mntx` não
+  conta como `/mnt`.
+- **Refinamento v3 — `rotational`** (parecer final Fable 5): serializar TODO `/mnt`
+  penalizava um SSD/NVMe montado ali sem necessidade. Agora `_path_needs_serial` resolve
+  o path → nó de dispositivo (mount de prefixo mais longo em `/proc/mounts`, via
+  `_dev_for_path`) → disco inteiro → lê `/sys/block/<disco>/queue/rotational` (`_rotational`,
+  sobe da partição p/ o disco). **`0` (SSD) libera o paralelismo mesmo sob `/mnt`**; `1`
+  (rotacional) ou desconhecido (`None`) **serializa** — padrão seguro, pois SMR
+  *drive-managed* (os Seagate USB) se reportam como disco comum e não há detecção honesta
+  de SMR pelo sysfs. Validado nos discos reais: `/mnt/optane`, `/mnt/SSD128Gb` (rot=0) →
+  paralelo; `/mnt/HDInternoBaixo`, `/mnt/DiscoQ` (rot=1) → serial.
 - **Sem deadlock de pool aninhado**: as subtarefas submetidas recebem `pool=None`, então
   só o nível de `OR` alcançado pela thread principal paraleliza; um `OR` aninhado dentro
   de outro não tenta pegar mais workers (o que poderia travar o pool com todos os
@@ -509,8 +519,9 @@ então rodam em paralelo num `ThreadPoolExecutor` — mas **só quando o disco a
 - **Correção preservada**: cada `_files_with_term` paralelo ainda dá `_reap` no seu
   processo (B1), e a opt#1 (restrição do AND) segue intacta — o pool só distribui os
   irmãos de `OR`.
-- **Testes**: `test_mnt_serializes` (serializa em `/mnt|/media|/run/media`, paraleliza
-  fora, `/mntx` não conta, um path em `/mnt` serializa a busca toda) e
+- **Testes**: `test_mnt_serializes` (mocka sysfs: rotacional/desconhecido em
+  `/mnt|/media|/run/media` serializa, **SSD sob `/mnt` paraleliza**, `/mntx` não conta,
+  misto com rotacional arrasta tudo p/ serial mas misto só-SSD não) e
   `test_or_parallel_correctness` (OR paralelo == OR serial, inclusive OR dentro de AND/NOT).
 
 ### 13.4 Otimização #3 — fd multi-glob → uma regex alternada (implementada)
@@ -640,8 +651,11 @@ nunca deixar I/O pendurado**. Na prática:
 ### 14.3 Paralelismo consciente (opt#2, implementada)
 
 A otimização **#2 (termos independentes em paralelo)** já está no código (§13.3) e é
-ligada **só quando os paths NÃO estão em `/mnt` / `/media` / `/run/media`**: em CMR/SSD,
-2–3 `rg` concorrentes aproveitam a CPU do i7; em SMR/USB, o *seek* concorrente faria mais
-mal que bem, então lá a busca continua **serializada** de propósito (`_max_workers`
-devolve 1). Essa é a regra de ouro do projeto: **paralelizar onde o disco aguenta,
-serializar onde ele sofre**. O grau de paralelismo é afinável por `LFS_WORKERS` (default 3).
+ligada **quando os paths NÃO estão sob `/mnt` / `/media` / `/run/media` num disco
+rotacional/desconhecido**: em CMR/SSD, 2–3 `rg` concorrentes aproveitam a CPU do i7; em
+SMR/USB rotacional, o *seek* concorrente faria mais mal que bem, então lá a busca continua
+**serializada** de propósito (`_max_workers` devolve 1). O **refinamento v3** olha o
+`rotational` do sysfs, então um SSD/NVMe montado sob `/mnt` (ex.: `/mnt/optane`) **não** é
+serializado à toa — só o rotacional (ou o desconhecido, por segurança) é. Essa é a regra de
+ouro do projeto: **paralelizar onde o disco aguenta, serializar onde ele sofre**. O grau de
+paralelismo é afinável por `LFS_WORKERS` (default 3; `1` serializa tudo).

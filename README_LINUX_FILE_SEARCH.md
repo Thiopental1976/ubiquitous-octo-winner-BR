@@ -109,8 +109,11 @@ esses discos:
 - **imagens grandes** não são decodificadas na hora (evita travar num SMR);
 - o **paralelismo é consciente do disco**: termos independentes (`OR`) rodam em
   paralelo no SSD/CMR, mas a busca é **serializada** automaticamente quando algum
-  caminho está em `/mnt` (ou `/media`, `/run/media`), poupando o SMR de *seek*
-  concorrente. Detalhes na §14 da documentação técnica.
+  caminho está em `/mnt` (ou `/media`, `/run/media`) sobre um disco **rotacional
+  ou desconhecido**, poupando o SMR de *seek* concorrente. Um SSD/NVMe montado ali
+  (checado via `/sys/block/<dev>/queue/rotational`) **não** é penalizado. O grau de
+  paralelismo é afinável pela variável de ambiente **`LFS_WORKERS`** (padrão `3`;
+  `LFS_WORKERS=1` serializa tudo). Detalhes na §14 da documentação técnica.
 
 ## Licença
 

@@ -266,6 +266,51 @@ def _under_mount(ap: str) -> bool:
     return any(ap == pre or ap.startswith(pre + os.sep) for pre in _MNT_PREFIXES)
 
 
+def _dev_for_path(ap: str) -> str:
+    """Nó de dispositivo (/dev/...) que sustenta `ap`, pelo mount de prefixo mais
+    longo em /proc/mounts. "" se não achar (então tratamos como desconhecido)."""
+    best_mp, best_dev = "", ""
+    try:
+        with open("/proc/mounts", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2 or not parts[0].startswith("/dev/"):
+                    continue
+                dev = parts[0]
+                mp = parts[1].replace("\\040", " ")   # espaço é escapado no mounts
+                if ap == mp or mp == "/" or ap.startswith(mp.rstrip("/") + "/"):
+                    if len(mp) >= len(best_mp):        # prefixo mais específico vence
+                        best_mp, best_dev = mp, dev
+    except OSError:
+        return ""
+    return best_dev
+
+
+def _rotational(dev: str):
+    """'1'/'0' de /sys/block/<disco>/queue/rotational p/ o disco que sustenta o nó
+    `dev` (sobe da partição p/ o disco inteiro). None se desconhecido."""
+    if not dev:
+        return None
+    name = os.path.basename(dev)                       # sdb1, nvme0n1p1...
+    try:
+        real = os.path.realpath("/sys/class/block/" + name)
+        parent = os.path.basename(os.path.dirname(real))
+        base = name if parent == "block" else parent   # disco inteiro se for partição
+        with open("/sys/block/%s/queue/rotational" % base, encoding="ascii") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _path_needs_serial(ap: str) -> bool:
+    """Serializa se o caminho está sob /mnt (etc.) E o disco que o sustenta é
+    rotacional ou desconhecido. SSD/NVMe confirmado (rotational=0) libera o
+    paralelismo mesmo sob /mnt — refinamento do parecer v3 (Fable 5)."""
+    if not _under_mount(ap):
+        return False
+    return _rotational(_dev_for_path(ap)) != "0"       # None (desconhecido) => serializa
+
+
 # ------------------------------------------------------------------ contagem de inacessíveis (N2)
 def _merge_denied(stats, local):
     """Soma o 'denied' contado num dict LOCAL no `stats` compartilhado, sob lock
@@ -291,10 +336,11 @@ def _reap_stats(proc, errf, stats):
 
 def _max_workers(q: engine.Query) -> int:
     """Opt#2: paraleliza scans independentes (OR) no i7, MAS serializa em /mnt —
-    os SMR/USB do acervo odeiam seek concorrente."""
+    os SMR/USB do acervo odeiam seek concorrente. Refinamento v3: um SSD/NVMe
+    montado sob /mnt NÃO serializa (só rotacional/desconhecido trava)."""
     if _WORKERS <= 1:
         return 1
-    if any(_under_mount(os.path.abspath(p)) for p in q.paths):
+    if any(_path_needs_serial(os.path.abspath(p)) for p in q.paths):
         return 1                             # trava SMR: uma varredura por vez
     return _WORKERS
 
