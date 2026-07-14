@@ -409,8 +409,8 @@ python3 lfs/app.py     # GUI    |    python3 lfs/cli.py --help    # CLI
 - `rga` pré-compilado só para `x86_64`; em outras arquiteturas, instalar pelo gerenciador.
 - Realce de preview e destaque só valem para termos **literais**; regex de conteúdo não é realçado.
 - Ordenação por coluna é habilitada ao fim da busca (durante a busca, ordem de chegada).
-- **Otimizações restantes** (§3 da auditoria; #1, #2 e #3 já foram feitas — ver §13/§14):
-  #4 callback `on_phase` no booleano ("passo 2/4: termo 'paciente'").
+- **Otimizações da §3 da auditoria: #1, #2, #3 e #4 concluídas** (ver §13/§14). Sobra o
+  N2 (plumbing de `stats` no modo booleano p/ o contador de inacessíveis).
 - Contador de "inacessíveis" só é atualizado ao fim de cada processo (no `_reap`), e o
   modo **booleano** ainda não recebe `stats` (fica 0 nesse modo) — plumbing pendente (N2).
 
@@ -421,7 +421,7 @@ python3 lfs/app.py     # GUI    |    python3 lfs/cli.py --help    # CLI
 | Módulo | Símbolos-chave |
 |---|---|
 | `engine.py` | `Query`, `Match`, `search`, `engine_info`, `_which`, `_iter_content_rg`, `_iter_names_fd`, `_iter_content_python`, `_iter_names_python`, `_passes_meta`, `_name_matcher`, `_glob_to_regex`, `_merge_globs`, `_reap` |
-| `boolean.py` | `parse`, `tokenize`, `search_boolean`, `positive_terms`, `_eval`, `_files_with_term`, `_universe`, `_display_lines`, `_term_set`, `_or_operands`, `_max_workers`, `_under_mount`, `BooleanError`, `Term/Not/And/Or` |
+| `boolean.py` | `parse`, `tokenize`, `search_boolean`, `positive_terms`, `_eval`, `_files_with_term`, `_universe`, `_display_lines`, `_term_set`, `_or_operands`, `_max_workers`, `_under_mount`, `_Phase`, `_all_terms`, `BooleanError`, `Term/Not/And/Or` |
 | `cli.py` | `main` (argparse) |
 | `app.py` | `MainWindow`, `SearchWorker`, `ResultModel`, `THEMES`, `build_style`, `media_kind`, `_build_preview`, `_show_media`, `_nav_media`, `apply_theme` |
 
@@ -537,6 +537,30 @@ fundidos numa **única regex alternada** e roda **um só `fd`**.
   varreduras** para **1** — 5× menos I/O de diretório (ver §14).
 - **Testes**: `test_glob_to_regex` (equivalência a fnmatch + recusa de glob com `/`) e
   `test_fd_merge_single_pass` (5 globs → **1 só** processo `fd`, união correta).
+
+### 13.5 Otimização #4 — callback `on_phase` no booleano (implementada)
+
+Uma busca booleana pesada (`(nota OR laudo) AND paciente NOT rascunho`) faz várias
+varreduras `rg -l` — antes, a UI só dizia "Buscando…". Agora
+`search_boolean(..., on_phase=cb)` relata a etapa: **"passo 2/4: termo 'paciente'"**
+e, no fim, **"passo 4/4: extraindo linhas"**.
+
+- **Onde**: `boolean._Phase` (contador de passos **thread-safe**), `boolean._all_terms`
+  (conta os termos distintos do AST, positivos e negados), `_eval`/`_term_set`/
+  `_universe_cached` recebem o `phase` e anunciam **só quando vão varrer o disco**
+  (cache hit é instantâneo, não vira passo). Na GUI: sinal `SearchWorker.phase` →
+  `MainWindow.on_phase` → texto no status (mostrado pelo heartbeat B8).
+- **Total de passos**: termos distintos + 1 (a extração de linhas dos positivos).
+  Cada termo é anunciado **uma vez** (dedup por nome), mesmo que a opt#1 o varra
+  restrito depois.
+- **Compatível com opt#2**: o contador é serializado por um `Lock` próprio, então a
+  numeração sai coerente mesmo com os `OR` avaliados em paralelo (o I/O é que corre
+  concorrente, não a contagem).
+- **Retrocompatível**: `on_phase` é opcional (default `None`); a CLI, que chama
+  `search_boolean(q, expr, out)`, continua igual.
+- **Testes**: `test_on_phase_reports` (passos 1..total, total correto, último passo é
+  "extraindo linhas", cada termo uma vez) e `test_on_phase_optional` (sem o callback,
+  a busca funciona igual).
 
 ---
 

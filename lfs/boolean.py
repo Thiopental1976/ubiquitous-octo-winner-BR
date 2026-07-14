@@ -266,11 +266,64 @@ def _max_workers(q: engine.Query) -> int:
     return _WORKERS
 
 
+# ------------------------------------------------------------------ progresso por fase (opt#4)
+class _Phase:
+    """Relata a etapa atual da busca booleana ('passo 2/4: termo "paciente"').
+    Cada termo DISTINTO conta como um passo; a extração de linhas é o passo final.
+    Thread-safe: a numeração fica consistente mesmo com OR avaliado em paralelo
+    (opt#2) — o `_lock` serializa a contagem, o I/O é que roda concorrente."""
+    def __init__(self, on_phase, total, has_display):
+        self._on = on_phase or (lambda d, t, label: None)
+        self.total = total
+        self._done = 0
+        self._seen = set()
+        self._lock = threading.Lock()
+        self.has_display = has_display
+
+    def term(self, term):
+        """Anuncia (só uma vez por termo) que ele começou a ser varrido do disco."""
+        with self._lock:
+            if term in self._seen:
+                return
+            self._seen.add(term)
+            self._done += 1
+            d = self._done
+        self._safe(d, f"termo “{term}”")
+
+    def note(self, label):
+        """Passo informativo (ex.: listar universo p/ NOT) sem consumir numeração."""
+        with self._lock:
+            d = self._done
+        self._safe(d, label)
+
+    def finish_display(self):
+        self._safe(self.total, "extraindo linhas")
+
+    def _safe(self, d, label):
+        try:
+            self._on(d, self.total, label)
+        except Exception:
+            pass
+
+
+def _all_terms(node):
+    """Todos os termos do AST (positivos E negados) — cada scan distinto é um passo."""
+    if isinstance(node, Term):
+        return [node.text]
+    if isinstance(node, Not):
+        return _all_terms(node.node)
+    if isinstance(node, (And, Or)):
+        return _all_terms(node.a) + _all_terms(node.b)
+    return []
+
+
 # ------------------------------------------------------------------ avaliação do AST
-def _universe_cached(q, cancel, universe_box):
+def _universe_cached(q, cancel, universe_box, phase=None):
     with _cache_lock:
         if universe_box[0] is not None:
             return universe_box[0]
+    if phase is not None:
+        phase.note("listando arquivos (NOT)")
     u = _universe(q, cancel)                 # I/O fora do lock
     with _cache_lock:
         if universe_box[0] is None:
@@ -278,17 +331,19 @@ def _universe_cached(q, cancel, universe_box):
         return universe_box[0]
 
 
-def _term_set(term, q, cancel, cache, restrict):
+def _term_set(term, q, cancel, cache, restrict, phase=None):
     """Conjunto de arquivos que contêm o termo.
     Sem restrição: usa/preenche o cache com o conjunto CHEIO (reuso entre nós).
     Com restrição (opt#1): intersecta o cache se já houver, senão varre SÓ os
     arquivos de `restrict` — o resultado é subconjunto e NÃO polui o cache.
     Thread-safe (opt#2): o I/O roda fora do lock; numa corrida, o pior caso é
-    recalcular o mesmo conjunto (idempotente) e `setdefault` mantém um só."""
+    recalcular o mesmo conjunto (idempotente) e `setdefault` mantém um só.
+    Opt#4: anuncia a fase só quando VAI varrer o disco (cache hit é instantâneo)."""
     if restrict is None:
         with _cache_lock:
             hit = cache.get(term)
         if hit is None:
+            if phase is not None: phase.term(term)
             hit = _files_with_term(term, q, cancel)
             with _cache_lock:
                 cache.setdefault(term, hit)
@@ -298,6 +353,7 @@ def _term_set(term, q, cancel, cache, restrict):
         hit = cache.get(term)
     if hit is not None:
         return hit & restrict
+    if phase is not None: phase.term(term)
     return _files_with_term(term, q, cancel, restrict=restrict)
 
 
@@ -308,7 +364,7 @@ def _or_operands(node):
     return [node]
 
 
-def _eval(node, q, cancel, cache, universe_box, restrict=None, pool=None):
+def _eval(node, q, cancel, cache, universe_box, restrict=None, pool=None, phase=None):
     """Avalia o AST -> conjunto de arquivos.
 
     Opt#1 (AND com restrição progressiva): o lado esquerdo de um AND vira o
@@ -322,16 +378,16 @@ def _eval(node, q, cancel, cache, universe_box, restrict=None, pool=None):
     só o nível de OR alcançado pela recursão na thread principal paraleliza,
     o que evita fome de workers (deadlock de pool aninhado)."""
     if isinstance(node, Term):
-        return _term_set(node.text, q, cancel, cache, restrict)
+        return _term_set(node.text, q, cancel, cache, restrict, phase)
     if isinstance(node, And):
-        sa = _eval(node.a, q, cancel, cache, universe_box, restrict, pool)
+        sa = _eval(node.a, q, cancel, cache, universe_box, restrict, pool, phase)
         if not sa:
             return set()                     # curto-circuito: nada satisfaz o AND
-        return _eval(node.b, q, cancel, cache, universe_box, restrict=sa, pool=pool)
+        return _eval(node.b, q, cancel, cache, universe_box, restrict=sa, pool=pool, phase=phase)
     if isinstance(node, Or):
         ops = _or_operands(node)
         if pool is not None and len(ops) > 1 and not cancel():
-            futs = [pool.submit(_eval, op, q, cancel, cache, universe_box, restrict, None)
+            futs = [pool.submit(_eval, op, q, cancel, cache, universe_box, restrict, None, phase)
                     for op in ops]
             out = set()
             for f in futs:
@@ -340,42 +396,51 @@ def _eval(node, q, cancel, cache, universe_box, restrict=None, pool=None):
         out = set()
         for op in ops:
             if cancel(): break
-            out |= _eval(op, q, cancel, cache, universe_box, restrict, pool)
+            out |= _eval(op, q, cancel, cache, universe_box, restrict, pool, phase)
         return out
     if isinstance(node, Not):
         if restrict is None:                 # NOT no topo: universo − termo (varredura cheia)
-            univ = _universe_cached(q, cancel, universe_box)
-            return univ - _eval(node.node, q, cancel, cache, universe_box, restrict=None, pool=pool)
+            univ = _universe_cached(q, cancel, universe_box, phase)
+            return univ - _eval(node.node, q, cancel, cache, universe_box, restrict=None, pool=pool, phase=phase)
         # NOT dentro de um AND: já restrito ao acumulado, subtrai o que casa nele
-        return restrict - _eval(node.node, q, cancel, cache, universe_box, restrict=restrict, pool=pool)
+        return restrict - _eval(node.node, q, cancel, cache, universe_box, restrict=restrict, pool=pool, phase=phase)
     raise BooleanError("nó desconhecido")
 
 
 # ------------------------------------------------------------------ API pública
 def search_boolean(q: engine.Query, expr: str, on_result, cancel=lambda: False,
-                   on_progress=lambda n: None):
+                   on_progress=lambda n: None, on_phase=None):
     """Resolve a expressão booleana -> arquivos, então emite Matches com linhas
-    dos termos positivos. Retorna (total, segundos)."""
+    dos termos positivos. Retorna (total, segundos).
+
+    Opt#4: `on_phase(done, total, label)` relata a etapa atual — 'passo 2/4:
+    termo "paciente"' e, por fim, 'passo 4/4: extraindo linhas'. Cada termo
+    DISTINTO é um passo; a extração de linhas dos positivos é o passo final."""
     import time
     t0 = time.time()
     ast = parse(expr)
     cache: dict = {}
     universe_box = [None]
+    pos = positive_terms(ast)
+    # opt#4: passos = termos distintos (positivos e negados) + 1 (extração de linhas)
+    n_terms = len(dict.fromkeys(_all_terms(ast)))
+    phase = _Phase(on_phase, n_terms + (1 if pos else 0), bool(pos))
     workers = _max_workers(q)                # opt#2: paraleliza OR fora de /mnt
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            files = _eval(ast, q, cancel, cache, universe_box, pool=pool)
+            files = _eval(ast, q, cancel, cache, universe_box, pool=pool, phase=phase)
     else:
-        files = _eval(ast, q, cancel, cache, universe_box)
+        files = _eval(ast, q, cancel, cache, universe_box, phase=phase)
     # B3: filtro de nome por REGEX (o glob já vai pro rg; regex é pós-filtro no basename)
     if q.name_is_regex and q.name_patterns:
         nrx = re.compile(q.name_patterns[0], 0 if q.case_sensitive else re.IGNORECASE)
         files = {f for f in files if nrx.search(os.path.basename(f))}
-    pos = positive_terms(ast)
 
     # passada de exibição: linhas dos termos positivos, só nos arquivos do resultado
     n = 0
     files_sorted = sorted(files)
+    if pos and not cancel():
+        phase.finish_display()               # opt#4: último passo
     lines_by_file = _display_lines(pos, files_sorted, q, cancel) if pos else {}
     for fp in files_sorted:
         if cancel(): break

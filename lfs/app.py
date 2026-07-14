@@ -78,6 +78,7 @@ parse_size = engine.parse_size          # §5: fonte única (era duplicado aqui 
 class SearchWorker(QThread):
     batch = Signal(list)             # lista de Match
     progress = Signal(int)           # varridos parciais
+    phase = Signal(int, int, str)    # opt#4: passo done/total + rótulo (modo booleano)
     done = Signal(int, float)        # total, segundos
     error = Signal(str)              # mensagem de erro (ex: sintaxe booleana)
 
@@ -107,10 +108,12 @@ class SearchWorker(QThread):
             self._flush()
         def on_prog(n):
             self.progress.emit(n)
+        def on_phase(d, t, label):
+            self.phase.emit(d, t, label)
         try:
             if self.boolexpr:
                 tot, dt = boolean.search_boolean(self.q, self.boolexpr, on_result,
-                                                 lambda: self._cancel, on_prog)
+                                                 lambda: self._cancel, on_prog, on_phase)
             else:
                 tot, dt = engine.search(self.q, on_result, lambda: self._cancel, on_prog,
                                         stats=self.stats)
@@ -670,10 +673,12 @@ class MainWindow(QMainWindow):
         if boolexpr: modes.append("booleano")
         if q.documents: modes.append("documentos")
         self._mode_tag = f"  ({' + '.join(modes)})" if modes else ""
+        self._phase_txt = ""                      # opt#4: passo atual (modo booleano)
         self.status.setText("Buscando…" + self._mode_tag)
         self.worker = SearchWorker(q, boolexpr)
         self.worker.batch.connect(self.model.append)
         self.worker.progress.connect(self.on_progress)
+        self.worker.phase.connect(self.on_phase)
         self.worker.done.connect(self.on_done)
         self.worker.error.connect(self.on_error)
         self.worker.start()
@@ -701,8 +706,15 @@ class MainWindow(QMainWindow):
         """B8: atualiza o status independentemente de lotes (busca longa não 'trava')."""
         d = self._denied()
         extra = f" · {d} inacessível(is)" if d else ""
+        ph = getattr(self, "_phase_txt", "")
+        step = f" · {ph}" if ph else ""           # opt#4: passo booleano atual
         self.status.setText(f"Buscando…{self._mode_tag}  {len(self.model.rows)} encontrados "
-                            f"· {time.time()-self.t0:.1f}s{extra}")
+                            f"· {time.time()-self.t0:.1f}s{extra}{step}")
+
+    def on_phase(self, done, total, label):
+        """Opt#4: recebe 'passo done/total: label' do motor booleano e mostra no status."""
+        self._phase_txt = f"passo {done}/{total}: {label}"
+        self._heartbeat()
 
     def on_error(self, msg):
         self._tick.stop()
@@ -714,6 +726,7 @@ class MainWindow(QMainWindow):
 
     def on_done(self, tot, dt):
         self._tick.stop()
+        self._phase_txt = ""                      # opt#4: fim das fases
         self.btn_search.setEnabled(True); self.btn_cancel.setEnabled(False)
         self.table.setSortingEnabled(True)        # B14: colunas ordenáveis ao fim
         cancelled = self.worker and self.worker._cancel

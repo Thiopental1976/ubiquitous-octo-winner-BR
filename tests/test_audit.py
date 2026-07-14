@@ -229,6 +229,45 @@ def test_and_progressive_restricts():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ------------------------------------------------------------------ opt#4 on_phase
+def test_on_phase_reports():
+    """Opt#4: on_phase relata passos coerentes (1..total), com o total = termos
+    distintos + 1 (extração de linhas), e o último passo é 'extraindo linhas'."""
+    d = _tree()
+    try:
+        fases = []
+        got = set()
+        boolean.search_boolean(
+            Query(paths=[d]), "(laudo OR assinatura) AND paciente",
+            lambda m: got.add(os.path.basename(m.path)), lambda: False,
+            on_phase=lambda done, total, label: fases.append((done, total, label)))
+        assert fases, "nenhuma fase relatada"
+        totais = {t for _, t, _ in fases}
+        assert totais == {4}, f"total devia ser 4 (laudo,assinatura,paciente + linhas): {totais}"
+        dones = [dn for dn, _, _ in fases]
+        assert all(1 <= dn <= 4 for dn in dones), f"passo fora de 1..4: {dones}"
+        assert max(dones) == 4 and "extraindo" in fases[-1][2], f"último passo errado: {fases[-1]}"
+        # termos distintos anunciados uma vez cada
+        rotulos_termo = [lb for _, _, lb in fases if lb.startswith("termo")]
+        assert len(rotulos_termo) == len(set(rotulos_termo)) == 3, f"termos: {rotulos_termo}"
+        print("ok  opt#4  on_phase relata passos 1..total e termina em 'extraindo linhas'")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_on_phase_optional():
+    """Opt#4: on_phase é opcional — sem ele, a busca funciona igual (retrocompat)."""
+    d = _tree()
+    try:
+        got = set()
+        boolean.search_boolean(Query(paths=[d]), "laudo AND paciente",
+                               lambda m: got.add(os.path.basename(m.path)), lambda: False)
+        assert got == {"N1.TXT", "n2.txt", "doc42.log", "ambos.log"}, f"veio {got}"
+        print("ok  opt#4  on_phase omitido não quebra a busca (retrocompatível)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ------------------------------------------------------------------ opt#3 fd multi-glob -> 1 regex
 def test_glob_to_regex():
     """A tradução glob->regex bate com fnmatch (é o que garante mesmo resultado)."""
@@ -341,7 +380,8 @@ def main():
            test_boolean_parser, test_fd_case_sensitive,
            test_and_progressive_correctness, test_and_progressive_restricts,
            test_glob_to_regex, test_fd_merge_single_pass,
-           test_mnt_serializes, test_or_parallel_correctness]
+           test_mnt_serializes, test_or_parallel_correctness,
+           test_on_phase_reports, test_on_phase_optional]
     fail = 0
     for fn in fns:
         try:
