@@ -46,7 +46,7 @@ MFT/USN do NTFS, que não existe aqui. Este projeto reimplementa a função de f
 Instalador universal (detecta apt/dnf/pacman/zypper; instala o app em `~/.local`, sem root):
 
 ```bash
-git clone https://github.com/rrdtoledo/ubiquitous-octo-winner-BR.git
+git clone https://github.com/Thiopental1976/ubiquitous-octo-winner-BR.git
 cd ubiquitous-octo-winner-BR
 ./install.sh
 ```
