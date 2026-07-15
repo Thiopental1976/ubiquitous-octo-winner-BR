@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Lançador do Linux File Search — usa o venv com PySide6.
-DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-PY="/home/rodrigo/linux_video_ai/venv/bin/python"
-[ -x "$PY" ] || PY="python3"
-exec "$PY" "$DIR/lfs/app.py" "$@"

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os, sys, time, subprocess, tempfile, shutil
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lfs"))
-import engine, boolean
+import engine, boolean, i18n
 from engine import Query
 
 
@@ -158,6 +158,92 @@ def test_boolean_parser():
     print("ok  §4  parser booleano (precedência, adjacência, | & !)")
 
 
+# ------------------------------------------------------------------ aspas sem fechamento
+def test_boolean_unterminated_quote():
+    """Aspas sem fechar viravam um termo até o fim da string, calado. Agora é erro:
+    melhor avisar que adivinhar o que o usuário quis buscar."""
+    from boolean import parse, BooleanError, Term
+    for expr in ('"paciente', 'laudo AND "paciente', '(a OR "b)'):
+        try:
+            parse(expr)
+        except BooleanError:
+            pass
+        else:
+            raise AssertionError(f"aceitou aspas sem fechamento: {expr!r}")
+    # o caminho normal segue intacto: aspas fechadas preservam o espaço
+    assert parse('"paciente laudo"') == Term("paciente laudo")
+    print("ok  §4b aspas sem fechamento viram BooleanError (fechadas seguem OK)")
+
+
+# ------------------------------------------------------------------ aspas vazias
+def test_boolean_empty_quoted_term():
+    """`""` virava Term('') e casaria TODO arquivo (rg -e '' aceita qualquer linha).
+    Agora é erro. `" "` (espaço literal) segue válido: é uma busca legítima."""
+    from boolean import parse, BooleanError, Term
+    for expr in ('""', 'laudo AND ""', '("" OR nota)'):
+        try:
+            parse(expr)
+        except BooleanError:
+            pass
+        else:
+            raise AssertionError(f"aceitou termo vazio: {expr!r}")
+    assert parse('" "') == Term(" ")     # espaço entre aspas não é vazio
+    print("ok  §4c termo vazio \"\" vira BooleanError (\" \" segue válido)")
+
+
+# ------------------------------------------------------------------ UX: nome "contém"
+def test_name_contains_semantics():
+    """Modelo Agent Ransack: texto puro no campo de nome significa 'contém'.
+    Digitar 'rotina' TEM de achar 'exames de rotina.txt', qualquer extensão.
+    Glob digitado pelo usuário (* ? [) é respeitado como está."""
+    assert engine.as_name_glob("rotina") == "*rotina*"
+    assert engine.as_name_glob("  rotina  ") == "*rotina*"
+    assert engine.as_name_glob("exames de rotina") == "*exames de rotina*"
+    assert engine.as_name_glob("*.pdf") == "*.pdf"          # glob: intacto
+    assert engine.as_name_glob("exames?.txt") == "exames?.txt"
+    assert engine.as_name_glob("n[12].txt") == "n[12].txt"
+    assert engine.as_name_glob("") == ""
+    d = tempfile.mkdtemp(prefix="lfs_ux_")
+    try:
+        for f in ("exames de rotina.txt", "ROTINA-2026.pdf", "outro arquivo.doc"):
+            with open(os.path.join(d, f), "w") as fh:
+                fh.write("x")
+        got = set()
+        engine.search(Query(paths=[d], name_patterns=[engine.as_name_glob("rotina")]),
+                      lambda m: got.add(os.path.basename(m.path)), lambda: False, lambda k: None)
+        assert got == {"exames de rotina.txt", "ROTINA-2026.pdf"}, got
+        got2 = set()  # fallback Python (fd desligado) tem de concordar com o fd
+        fd_bak, engine.FD = engine.FD, None
+        try:
+            engine.search(Query(paths=[d], name_patterns=[engine.as_name_glob("rotina")]),
+                          lambda m: got2.add(os.path.basename(m.path)), lambda: False, lambda k: None)
+        finally:
+            engine.FD = fd_bak
+        assert got == got2, (got, got2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("ok  UX  nome 'contém': rotina acha 'exames de rotina.txt' (glob intacto)")
+
+
+# ------------------------------------------------------------------ UX: multidiscos
+def test_user_mounts_parsing():
+    """Discos do menu "Discos ▾": só dispositivos reais (/dev/*) sob /media, /mnt
+    ou /run/media; espaço no rótulo do disco vem escapado (\\040) e é decodificado."""
+    lines = [
+        "/dev/nvme0n1p2 / ext4 rw 0 0\n",                              # raiz: fora
+        "/dev/sdb1 /mnt/acervo ext4 rw 0 0\n",
+        "/dev/sdc1 /media/rodrigo/Backup\\040Externo ext4 rw 0 0\n",   # espaço escapado
+        "tmpfs /run tmpfs rw 0 0\n",                                   # não é /dev/*
+        "/dev/sdd1 /run/media/rodrigo/PENDRIVE vfat rw 0 0\n",
+        "/dev/loop3 /snap/foo squashfs ro 0 0\n",                      # loop fora de /media|/mnt
+    ]
+    got = engine.user_mounts(lines)
+    assert got == ["/media/rodrigo/Backup Externo", "/mnt/acervo",
+                   "/run/media/rodrigo/PENDRIVE"], got
+    assert isinstance(engine.user_mounts(), list)   # leitura real não explode
+    print("ok  UX  user_mounts: /dev/* sob /media|/mnt|/run/media (espaço decodificado)")
+
+
 # ------------------------------------------------------------------ N1 fd caixa-sensível
 def test_fd_case_sensitive():
     """N1: com 'Aa' LIGADO, o fd não pode vazar por smart-case.
@@ -278,8 +364,9 @@ def test_boolean_stats_denied():
 # ------------------------------------------------------------------ opt#4 on_phase
 def test_on_phase_reports():
     """Opt#4: on_phase relata passos coerentes (1..total), com o total = termos
-    distintos + 1 (extração de linhas), e o último passo é 'extraindo linhas'."""
+    distintos + 1 (extração de linhas), e o último passo é 'extracting lines'."""
     d = _tree()
+    import i18n; i18n.set_lang("en")     # rótulos determinísticos (fonte inglesa)
     try:
         fases = []
         got = set()
@@ -292,12 +379,13 @@ def test_on_phase_reports():
         assert totais == {4}, f"total devia ser 4 (laudo,assinatura,paciente + linhas): {totais}"
         dones = [dn for dn, _, _ in fases]
         assert all(1 <= dn <= 4 for dn in dones), f"passo fora de 1..4: {dones}"
-        assert max(dones) == 4 and "extraindo" in fases[-1][2], f"último passo errado: {fases[-1]}"
+        assert max(dones) == 4 and "extracting" in fases[-1][2], f"último passo errado: {fases[-1]}"
         # termos distintos anunciados uma vez cada
-        rotulos_termo = [lb for _, _, lb in fases if lb.startswith("termo")]
+        rotulos_termo = [lb for _, _, lb in fases if lb.startswith("term ")]
         assert len(rotulos_termo) == len(set(rotulos_termo)) == 3, f"termos: {rotulos_termo}"
-        print("ok  opt#4  on_phase relata passos 1..total e termina em 'extraindo linhas'")
+        print("ok  opt#4  on_phase relata passos 1..total e termina em 'extracting lines'")
     finally:
+        i18n.set_lang(None)              # volta à autodetecção
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -434,16 +522,104 @@ def test_or_parallel_correctness():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ------------------------------------------------------------------ i18n
+def test_i18n_mechanism():
+    """i18n: inglês é a fonte; pt traduz; chave ausente cai literal; format ok."""
+    try:
+        i18n.set_lang("en")
+        assert i18n.t("Ready.") == "Ready."
+        assert i18n.t("{n} path(s) copied.", n=3) == "3 path(s) copied."
+        i18n.set_lang("pt")
+        assert i18n.t("Ready.") == "Pronto."
+        assert i18n.t("Searching…") == "Buscando…"
+        assert i18n.t("{n} path(s) copied.", n=3) == "3 caminho(s) copiado(s)."
+        assert i18n.t("chave inexistente") == "chave inexistente"   # fallback literal
+        # autodetecção pelo locale
+        for env, exp in [("en_US.UTF-8", "en"), ("pt_BR.UTF-8", "pt"),
+                         ("pt_PT", "pt"), ("es_ES.UTF-8", "en"), ("C", "en")]:
+            assert i18n._normalize(env) == exp, (env, i18n._normalize(env))
+        print("ok  i18n  inglês-base + pt, fallback literal, detecção de locale")
+    finally:
+        i18n.set_lang(None)
+
+
+def test_i18n_no_stale_keys():
+    """Toda chave do dicionário PT precisa existir como literal t(...) no código —
+    pega 'drift' (typo entre a fonte no código e a chave da tradução)."""
+    import re
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lfs")
+    src = ""
+    for fn in ("app.py", "boolean.py"):
+        with open(os.path.join(base, fn), encoding="utf-8") as f:
+            src += f.read()
+    lits = set()
+    for m in re.finditer(r"""t\(\s*((?:(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*)+)""", src):
+        parts = re.findall(r"""(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)')""", m.group(1))
+        joined = "".join(a or b for a, b in parts)
+        for esc, real in (('\\n', '\n'), ('\\"', '"'), ("\\'", "'"), ('\\\\', '\\')):
+            joined = joined.replace(esc, real)
+        lits.add(joined)
+    dynamic = set(engine.__dict__.get("_HEADERS_SOURCE", ())) | \
+        {"File", "Folder", "Size", "Modified"}          # via t(self.HEADERS[s])
+    stale = [k for k in i18n._PT if k not in lits and k not in dynamic]
+    assert not stale, "chaves PT sem uso no código (drift):\n" + "\n".join(map(repr, stale))
+    print(f"ok  i18n  sem chaves órfãs ({len(i18n._PT)} chaves cobertas)")
+
+
+# ------------------------------------------------------------------ nome: pastas
+def test_name_search_includes_dirs():
+    """Busca só-por-nome acha ARQUIVOS e PASTAS (case-insensitive), pelos dois
+    caminhos: fd (se houver) e fallback os.walk. Pasta não casa -> não aparece."""
+    d = tempfile.mkdtemp(prefix="lfs_dir_")
+    try:
+        os.makedirs(os.path.join(d, "ARGENTINA", "sub"))
+        os.makedirs(os.path.join(d, "Pasta_argentina_casting"))
+        os.makedirs(os.path.join(d, "outra"))
+        for f in ("relatorio_Argentina.txt", "sem_match.txt"):
+            open(os.path.join(d, f), "w").close()
+        open(os.path.join(d, "outra", "ARGENTINA2024.mp4"), "w").close()
+
+        def run(use_fd):
+            old = engine.FD
+            if not use_fd:
+                engine.FD = None
+            try:
+                q = Query(paths=[d], name_patterns=[engine.as_name_glob("argentina")])
+                got = []
+                engine.search(q, lambda m: got.append(m), lambda: False)
+                return got
+            finally:
+                engine.FD = old
+
+        for use_fd in ((True, False) if engine.FD else (False,)):
+            got = run(use_fd)
+            dirs = {os.path.relpath(m.path, d) for m in got if m.is_dir}
+            files = {os.path.relpath(m.path, d) for m in got if not m.is_dir}
+            tag = "fd" if use_fd else "python"
+            assert "ARGENTINA" in dirs, (tag, dirs)
+            assert "Pasta_argentina_casting" in dirs, (tag, dirs)
+            assert "relatorio_Argentina.txt" in files, (tag, files)
+            assert any("ARGENTINA2024.mp4" in f for f in files), (tag, files)
+            assert "outra" not in dirs and "sem_match.txt" not in files, (tag, got)
+        print("ok  UX  nome acha arquivos E pastas (case-insensitive; fd e python)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     fns = [test_parse_size, test_reap_kills_process, test_no_orphan_on_cancel,
            test_glob_case_insensitive, test_boolean_name_regex,
            test_display_lines_batched, test_one_file_system_fallback,
-           test_boolean_parser, test_fd_case_sensitive,
+           test_boolean_parser, test_boolean_unterminated_quote,
+           test_boolean_empty_quoted_term, test_name_contains_semantics,
+           test_user_mounts_parsing, test_fd_case_sensitive,
            test_and_progressive_correctness, test_and_progressive_restricts,
            test_glob_to_regex, test_fd_merge_single_pass,
            test_mnt_serializes, test_or_parallel_correctness,
            test_on_phase_reports, test_on_phase_optional,
-           test_walk_onerror_counts_denied, test_boolean_stats_denied]
+           test_walk_onerror_counts_denied, test_boolean_stats_denied,
+           test_i18n_mechanism, test_i18n_no_stale_keys,
+           test_name_search_includes_dirs]
     fail = 0
     for fn in fns:
         try:

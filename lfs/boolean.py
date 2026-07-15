@@ -22,8 +22,10 @@ from typing import Optional
 
 try:                       # funciona como pacote (-m lfs.boolean / GUI) e flat (cli.py)
     from . import engine    # RG, Query, Match, _passes_meta, _iter_content_python
+    from .i18n import t
 except ImportError:
     import engine
+    from i18n import t
 
 
 # ------------------------------------------------------------------ AST
@@ -58,6 +60,11 @@ def tokenize(s: str):
             j = i + 1
             while j < n and s[j] != '"':
                 j += 1
+            if j >= n:                    # sem fechamento: antes virava termo até o fim,
+                raise BooleanError(       # silenciosamente. Melhor avisar que adivinhar.
+                    f'aspas sem fechamento em: {s[i:]!r}')
+            if j == i + 1:                # "" vazio casaria TODO arquivo (rg -e "")
+                raise BooleanError('termo vazio ("") na expressão')
             toks.append(("TERM", s[i+1:j])); i = j + 1; continue
         if c in "&|":                     # & && | ||
             if i+1 < n and s[i+1] == c:
@@ -352,7 +359,7 @@ class _Phase:
     Thread-safe: a numeração fica consistente mesmo com OR avaliado em paralelo
     (opt#2) — o `_lock` serializa a contagem, o I/O é que roda concorrente."""
     def __init__(self, on_phase, total, has_display):
-        self._on = on_phase or (lambda d, t, label: None)
+        self._on = on_phase or (lambda d, tot, label: None)
         self.total = total
         self._done = 0
         self._seen = set()
@@ -367,7 +374,7 @@ class _Phase:
             self._seen.add(term)
             self._done += 1
             d = self._done
-        self._safe(d, f"termo “{term}”")
+        self._safe(d, t("term “{term}”", term=term))
 
     def note(self, label):
         """Passo informativo (ex.: listar universo p/ NOT) sem consumir numeração."""
@@ -376,7 +383,7 @@ class _Phase:
         self._safe(d, label)
 
     def finish_display(self):
-        self._safe(self.total, "extraindo linhas")
+        self._safe(self.total, t("extracting lines"))
 
     def _safe(self, d, label):
         try:
@@ -402,7 +409,7 @@ def _universe_cached(q, cancel, universe_box, phase=None, stats=None):
         if universe_box[0] is not None:
             return universe_box[0]
     if phase is not None:
-        phase.note("listando arquivos (NOT)")
+        phase.note(t("listing files (NOT)"))
     u = _universe(q, cancel, stats)          # I/O fora do lock
     with _cache_lock:
         if universe_box[0] is None:

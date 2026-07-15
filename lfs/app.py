@@ -12,7 +12,7 @@ from __future__ import annotations
 import os, sys, time
 
 from PySide6.QtCore import (Qt, QThread, Signal, QAbstractTableModel, QModelIndex,
-                            QUrl, QTimer, QSortFilterProxyModel)
+                            QUrl, QTimer, QSortFilterProxyModel, QRect, QSize)
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QGuiApplication,
                            QIcon, QImageReader, QPixmap, QKeySequence, QShortcut,
                            QTextCharFormat, QTextCursor, QTextDocument)
@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QCheckBox, QLabel, QTableView, QPlainTextEdit,
     QFileDialog, QSplitter, QHeaderView, QSpinBox, QMenu, QTextEdit,
-    QAbstractItemView, QToolButton, QFrame, QStackedWidget, QSlider, QSizePolicy)
+    QAbstractItemView, QToolButton, QFrame, QStackedWidget, QSlider, QSizePolicy,
+    QLayout)
 
 try:
     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -30,8 +31,9 @@ except ImportError:                     # QtMultimedia opcional (portabilidade)
     HAS_MEDIA = False
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import engine, boolean
+import engine, boolean, i18n
 from engine import Query, Match
+from i18n import t
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
 
@@ -74,6 +76,52 @@ def human_size(n: int) -> str:
 parse_size = engine.parse_size          # §5: fonte única (era duplicado aqui e no cli)
 
 
+class FlowLayout(QLayout):
+    """Layout que QUEBRA LINHA (estilo tags). A linha de chips em QHBoxLayout
+    impunha ~1135px de largura mínima à janela — mais que uma tela 1080px em
+    retrato, e o Muffin/Cinnamon suprime o botão de maximizar de janela que não
+    cabe. Com quebra, o mínimo cai para a largura do maior chip."""
+    def __init__(self, parent=None, hspacing=7, vspacing=6):
+        super().__init__(parent)
+        self._items, self._h, self._v = [], hspacing, vspacing
+
+    def addItem(self, it): self._items.append(it)
+    def count(self): return len(self._items)
+    def itemAt(self, i): return self._items[i] if 0 <= i < len(self._items) else None
+    def takeAt(self, i): return self._items.pop(i) if 0 <= i < len(self._items) else None
+    def expandingDirections(self): return Qt.Orientations(0)
+    def hasHeightForWidth(self): return True
+    def heightForWidth(self, w): return self._arrange(QRect(0, 0, w, 0), dry=True)
+    def sizeHint(self): return self.minimumSize()
+
+    def setGeometry(self, r):
+        super().setGeometry(r)
+        self._arrange(r, dry=False)
+
+    def minimumSize(self):
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _arrange(self, rect, dry):
+        m = self.contentsMargins()
+        x, y, row_h = rect.x() + m.left(), rect.y() + m.top(), 0
+        right = rect.right() - m.right()
+        for it in self._items:
+            w, h = it.sizeHint().width(), it.sizeHint().height()
+            if row_h and x + w > right:              # não coube: próxima linha
+                x = rect.x() + m.left()
+                y += row_h + self._v
+                row_h = 0
+            if not dry:
+                it.setGeometry(QRect(x, y, w, h))
+            x += w + self._h
+            row_h = max(row_h, h)
+        return y + row_h + m.bottom() - rect.y()
+
+
 # ----------------------------------------------------------------- worker
 class SearchWorker(QThread):
     batch = Signal(list)             # lista de Match
@@ -108,8 +156,8 @@ class SearchWorker(QThread):
             self._flush()
         def on_prog(n):
             self.progress.emit(n)
-        def on_phase(d, t, label):
-            self.phase.emit(d, t, label)
+        def on_phase(d, total, label):
+            self.phase.emit(d, total, label)
         try:
             if self.boolexpr:
                 tot, dt = boolean.search_boolean(self.q, self.boolexpr, on_result,
@@ -128,7 +176,7 @@ class SearchWorker(QThread):
 
 # ----------------------------------------------------------------- modelo
 class ResultModel(QAbstractTableModel):
-    HEADERS = ["Arquivo", "Pasta", "Matches", "Tamanho", "Modificado"]
+    HEADERS = ["File", "Folder", "Matches", "Size", "Modified"]   # source (EN); i18n em headerData
     SORT_ROLE = Qt.UserRole + 1
 
     def __init__(self):
@@ -143,7 +191,7 @@ class ResultModel(QAbstractTableModel):
 
     def headerData(self, s, o, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and o == Qt.Horizontal:
-            return self.HEADERS[s]
+            return t(self.HEADERS[s])
         return None
 
     def data(self, idx, role=Qt.DisplayRole):
@@ -152,10 +200,10 @@ class ResultModel(QAbstractTableModel):
         m = self.rows[idx.row()]
         c = idx.column()
         if role == Qt.DisplayRole:
-            if c == 0: return os.path.basename(m.path)
+            if c == 0: return os.path.basename(m.path) + ("/" if m.is_dir else "")
             if c == 1: return os.path.dirname(m.path)
             if c == 2: return str(m.nmatch) if m.nmatch else ""
-            if c == 3: return human_size(m.size)
+            if c == 3: return "" if m.is_dir else human_size(m.size)
             if c == 4: return time.strftime("%Y-%m-%d %H:%M", time.localtime(m.mtime)) if m.mtime else ""
         elif role == Qt.TextAlignmentRole and c in (2, 3):
             return int(Qt.AlignRight | Qt.AlignVCenter)
@@ -241,7 +289,7 @@ QLineEdit, QSpinBox, QPlainTextEdit {{
     background: {bg1}; color: {txt}; border: 1px solid {border};
     border-radius: 9px; padding: 7px 10px; selection-background-color: {accent_dim}; }}
 QLineEdit:focus, QSpinBox:focus {{ border: 1px solid {accent}; }}
-QLineEdit#content {{ font-size: 14px; padding: 9px 12px; }}
+QLineEdit#primaryfield {{ font-size: 14px; padding: 9px 12px; }}
 QPlainTextEdit {{ padding: 8px 10px; }}
 
 QPushButton {{ background: {bg2}; color: {txt}; border: 1px solid {border2};
@@ -319,7 +367,7 @@ def _badge(name: str, present: bool, pal: dict) -> QLabel:
     col = pal["green"] if present else pal["muted"]
     lab = QLabel(f'<span style="color:{col}">●</span> '
                  f'<span style="color:{pal["muted"]}">{name}</span>')
-    lab.setToolTip(f"{name}: {'disponível' if present else 'ausente'}")
+    lab.setToolTip(f"{name}: {t('available') if present else t('missing')}")
     return lab
 
 
@@ -328,7 +376,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Linux File Search")
-        self.resize(1160, 760)
+        # cabe SEMPRE na tela (monitor em retrato tem só ~1080 de largura útil);
+        # janela maior que a tela perde o botão de maximizar no Muffin/Cinnamon
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        self.resize(min(1160, scr.width() - 24), min(760, scr.height() - 48))
         ico = os.path.join(ASSETS, "icon_256.png")
         if os.path.exists(ico):
             self.setWindowIcon(QIcon(ico))
@@ -346,8 +397,9 @@ class MainWindow(QMainWindow):
         self._build()
         self.apply_theme(self.theme)
         QShortcut(QKeySequence(Qt.Key_Escape), self, self.cancel_search)
-        QShortcut(QKeySequence("Ctrl+L"), self, lambda: self.ed_content.setFocus())
+        QShortcut(QKeySequence("Ctrl+L"), self, lambda: self.ed_name.setFocus())
         QShortcut(QKeySequence("Ctrl+T"), self, self.toggle_theme)
+        self.ed_name.setFocus()                   # digitar e Enter, sem clique
 
     # ---- UI
     def _build(self):
@@ -363,82 +415,110 @@ class MainWindow(QMainWindow):
             logo.setPixmap(QPixmap(pm).scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         hl.addWidget(logo)
         tt = QVBoxLayout(); tt.setSpacing(0)
-        t = QLabel("Linux File Search"); t.setObjectName("title")
-        s = QLabel("busca ampla de arquivos — nome · conteúdo · booleano · documentos")
+        ttl = QLabel("Linux File Search"); ttl.setObjectName("title")
+        s = QLabel(t("broad file search — name · content · boolean · documents"))
         s.setObjectName("subtitle")
-        tt.addWidget(t); tt.addWidget(s); hl.addLayout(tt); hl.addStretch(1)
+        tt.addWidget(ttl); tt.addWidget(s); hl.addLayout(tt); hl.addStretch(1)
         self.badges = QHBoxLayout(); self.badges.setSpacing(10)
         hl.addLayout(self.badges)
         hl.addSpacing(10)
         self.btn_theme = QToolButton(); self.btn_theme.setCursor(Qt.PointingHandCursor)
-        self.btn_theme.setToolTip("Alternar tema claro/escuro (Ctrl+T)")
+        self.btn_theme.setToolTip(t("Toggle light/dark theme (Ctrl+T)"))
         self.btn_theme.clicked.connect(self.toggle_theme)
         hl.addWidget(self.btn_theme)
         root.addWidget(header)
 
-        # ---------- barra de busca ----------
+        # ---------- barra PRINCIPAL: nome do arquivo ----------
+        # Achar arquivo é o caso primário (modelo Agent Ransack): o campo grande
+        # ao lado do Buscar é o NOME. Texto puro = "contém" (rotina acha
+        # "exames de rotina.txt"); globs (* ? [) valem literais.
         r1 = QHBoxLayout(); r1.setSpacing(8)
+        self.ed_name = QLineEdit(); self.ed_name.setObjectName("primaryfield")
+        self.ed_name.setClearButtonEnabled(True)
+        self.ed_name.setPlaceholderText(
+            t("File name — e.g. report  ·  *.pdf  ·  exams*.txt   (empty = all)"))
+        self.ed_name.setToolTip(t(
+            "Search by NAME. Plain text means “contains”: report finds\n"
+            "“routine exams.txt” in any extension. Multiple terms separated\n"
+            "by comma (OR). Hand-typed globs (* ? [) are honored as typed."))
+        self.ed_name.returnPressed.connect(self.start_search)
+        self.btn_search = QPushButton(t("  Search  ")); self.btn_search.setObjectName("primary")
+        self.btn_search.setDefault(True); self.btn_search.clicked.connect(self.start_search)
+        self.btn_cancel = QPushButton(t("Cancel")); self.btn_cancel.clicked.connect(self.cancel_search)
+        self.btn_cancel.setEnabled(False)
+        r1.addWidget(self.ed_name, 1); r1.addWidget(self.btn_search); r1.addWidget(self.btn_cancel)
+        root.addLayout(r1)
+
+        # ---------- linha secundária (opcional): conteúdo + pasta ----------
+        r2 = QHBoxLayout(); r2.setSpacing(8)
+        lbl_c = QLabel(t("Content")); lbl_c.setObjectName("section")
         self.ed_content = QLineEdit(); self.ed_content.setObjectName("content")
         self.ed_content.setClearButtonEnabled(True)
         self.ed_content.setPlaceholderText(
-            "Conteúdo a conter (texto ou regex)…   — vazio = busca só por nome")
+            t("optional — text the file must contain (boolean: toggle the chip)"))
         self.ed_content.returnPressed.connect(self.start_search)
-        self.btn_search = QPushButton("  Buscar  "); self.btn_search.setObjectName("primary")
-        self.btn_search.setDefault(True); self.btn_search.clicked.connect(self.start_search)
-        self.btn_cancel = QPushButton("Cancelar"); self.btn_cancel.clicked.connect(self.cancel_search)
-        self.btn_cancel.setEnabled(False)
-        r1.addWidget(self.ed_content, 1); r1.addWidget(self.btn_search); r1.addWidget(self.btn_cancel)
-        root.addLayout(r1)
-
-        # ---------- nome + pasta ----------
-        r2 = QHBoxLayout(); r2.setSpacing(8)
-        lbl_n = QLabel("Nome"); lbl_n.setObjectName("section")
-        self.ed_name = QLineEdit("*"); self.ed_name.setPlaceholderText("*.py, *.txt, *.pdf")
-        self.ed_name.setMaximumWidth(260); self.ed_name.returnPressed.connect(self.start_search)
-        lbl_e = QLabel("Em"); lbl_e.setObjectName("section")
+        lbl_e = QLabel(t("In")); lbl_e.setObjectName("section")
         self.ed_path = QLineEdit(os.path.expanduser("~"))
-        self.ed_path.setPlaceholderText("Pasta(s) — separe por ';'")
+        self.ed_path.setPlaceholderText(t("Folder(s)/mounts — separate with ';'"))
+        self.ed_path.setToolTip(t("Multiple starting points separated by ';' —\n"
+                                  "e.g. ~/Documents;/mnt/archive;/media/backup"))
         self.ed_path.returnPressed.connect(self.start_search)
-        btn_browse = QToolButton(); btn_browse.setText("Procurar…"); btn_browse.clicked.connect(self.browse)
-        r2.addWidget(lbl_n); r2.addWidget(self.ed_name)
+        btn_browse = QToolButton(); btn_browse.setText(t("Browse…")); btn_browse.clicked.connect(self.browse)
+        # multidiscos como OPÇÃO visível: marca/desmarca discos montados sem
+        # o usuário precisar conhecer a sintaxe do ';'
+        self.btn_disks = QToolButton(); self.btn_disks.setText(t("Disks ▾"))
+        self.btn_disks.setToolTip(t("Multi-disk search: add/remove mounted disks\n"
+                                    "(/mnt, /media, /run/media) from the 'In' folder list."))
+        self.btn_disks.setPopupMode(QToolButton.InstantPopup)
+        self.mnu_disks = QMenu(self)
+        self.mnu_disks.aboutToShow.connect(self._fill_disks_menu)
+        self.btn_disks.setMenu(self.mnu_disks)
+        r2.addWidget(lbl_c); r2.addWidget(self.ed_content, 3)
         r2.addSpacing(6)
-        r2.addWidget(lbl_e); r2.addWidget(self.ed_path, 1); r2.addWidget(btn_browse)
+        r2.addWidget(lbl_e); r2.addWidget(self.ed_path, 2)
+        r2.addWidget(self.btn_disks); r2.addWidget(btn_browse)
         root.addLayout(r2)
 
-        # ---------- chips de opção ----------
+        # ---------- chips de opção (FlowLayout: quebra linha em janela estreita) ----------
         bar = QFrame(); bar.setObjectName("toolbar")
-        r3 = QHBoxLayout(bar); r3.setContentsMargins(12, 8, 12, 8); r3.setSpacing(7)
-        self.ck_case = QCheckBox("Aa"); self.ck_case.setToolTip("Sensível a maiúsculas/minúsculas")
-        self.ck_word = QCheckBox("palavra"); self.ck_word.setToolTip("Palavra inteira")
-        self.ck_bool = QCheckBox("booleano"); self.ck_bool.setToolTip(
-            "Interpreta o campo Conteúdo como expressão: (A OR B) AND C NOT D\n"
-            "Também aceita | & !  e \"aspas\" p/ frases. Precedência NOT>AND>OR.")
+        r3 = FlowLayout(bar); r3.setContentsMargins(12, 8, 12, 8)
+        self.ck_case = QCheckBox("Aa"); self.ck_case.setToolTip(t("Case sensitive"))
+        self.ck_word = QCheckBox(t("word")); self.ck_word.setToolTip(t("Whole word"))
+        self.ck_bool = QCheckBox(t("boolean")); self.ck_bool.setToolTip(t(
+            "Reads the Content field as an expression: (A OR B) AND C NOT D\n"
+            "Also accepts | & !  and \"quotes\" for phrases. Precedence NOT>AND>OR."))
         self.ck_bool.toggled.connect(self._on_bool_toggled)
-        self.ck_doc = QCheckBox("documentos")
+        self.ck_doc = QCheckBox(t("documents"))
         self.ck_doc.toggled.connect(self._on_doc_toggled)      # B6
         if engine.RGA:
-            self.ck_doc.setToolTip("Busca DENTRO de PDF/docx/epub/odt/zip… (ripgrep-all).")
+            self.ck_doc.setToolTip(t("Searches INSIDE PDF/docx/epub/odt/zip… (ripgrep-all)."))
         else:
             self.ck_doc.setEnabled(False)
-            self.ck_doc.setToolTip("Requer 'ripgrep-all' (rga) — rode o instalador.")
-        self.ck_crx = QCheckBox("regex conteúdo")
-        self.ck_nrx = QCheckBox("regex nome")
-        self.ck_rec = QCheckBox("subpastas"); self.ck_rec.setChecked(True)
-        self.ck_hid = QCheckBox("ocultos")
-        self.ck_git = QCheckBox(".gitignore"); self.ck_git.setToolTip("Respeitar regras .gitignore")
-        self.ck_ofs = QCheckBox("1 disco"); self.ck_ofs.setToolTip(
-            "--one-file-system: não entra em outros pontos de montagem")
+            self.ck_doc.setToolTip(t("Requires 'ripgrep-all' (rga) — run the installer."))
+        self.ck_crx = QCheckBox(t("content regex"))
+        self.ck_nrx = QCheckBox(t("name regex"))
+        self.ck_rec = QCheckBox(t("subfolders")); self.ck_rec.setChecked(True)
+        self.ck_hid = QCheckBox(t("hidden"))
+        self.ck_git = QCheckBox(".gitignore"); self.ck_git.setToolTip(t("Respect .gitignore rules"))
+        self.ck_ofs = QCheckBox(t("1 disk")); self.ck_ofs.setToolTip(t(
+            "--one-file-system: don't cross into other mount points"))
         for w in (self.ck_case, self.ck_word, self.ck_bool, self.ck_doc, self.ck_crx,
                   self.ck_nrx, self.ck_rec, self.ck_hid, self.ck_git, self.ck_ofs):
             r3.addWidget(w)
-        r3.addStretch(1)
-        lsz = QLabel("Tam ≥"); lsz.setObjectName("section"); r3.addWidget(lsz)
+        # rótulo+campo num mini-widget: a quebra de linha não pode separá-los
+        def _pair(label, field):
+            box = QWidget(); h = QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0); h.setSpacing(5)
+            lab = QLabel(label); lab.setObjectName("section")
+            h.addWidget(lab); h.addWidget(field)
+            return box
         self.ed_minsz = QLineEdit(); self.ed_minsz.setFixedWidth(66)
-        self.ed_minsz.setPlaceholderText("10M"); r3.addWidget(self.ed_minsz)
-        lmod = QLabel("Últimos"); lmod.setObjectName("section"); r3.addWidget(lmod)
+        self.ed_minsz.setPlaceholderText("10M")
+        r3.addWidget(_pair(t("Size ≥"), self.ed_minsz))
         self.sp_days = QSpinBox(); self.sp_days.setRange(0, 3650)
         self.sp_days.setSpecialValueText("—"); self.sp_days.setSuffix(" d")
-        self.sp_days.setFixedWidth(70); r3.addWidget(self.sp_days)
+        self.sp_days.setFixedWidth(70)
+        r3.addWidget(_pair(t("Last"), self.sp_days))
         root.addWidget(bar)
 
         # ---------- resultados / preview ----------
@@ -475,7 +555,7 @@ class MainWindow(QMainWindow):
         root.addWidget(split, 1)
 
         # ---------- status ----------
-        self.status = QLabel("Pronto.")
+        self.status = QLabel(t("Ready."))
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         root.addWidget(self.status)   # estilo aplicado em apply_theme()
 
@@ -487,7 +567,7 @@ class MainWindow(QMainWindow):
         self.preview = QPlainTextEdit(); self.preview.setReadOnly(True)
         self.preview.setLineWrapMode(QPlainTextEdit.NoWrap)
         f = QFont("monospace"); f.setStyleHint(QFont.Monospace); self.preview.setFont(f)
-        self.preview.setPlaceholderText("Selecione um resultado para ver o trecho…")
+        self.preview.setPlaceholderText(t("Select a result to see the snippet…"))
         self.pv_stack.addWidget(self.preview)
 
         # página 1: mídia (imagem / vídeo / áudio) + transporte
@@ -525,17 +605,17 @@ class MainWindow(QMainWindow):
         bar = QFrame(); bar.setObjectName("mediabar")
         bl = QHBoxLayout(bar); bl.setContentsMargins(10, 7, 10, 7); bl.setSpacing(9)
         self.btn_prev = QToolButton(); self.btn_prev.setObjectName("transport")
-        self.btn_prev.setText("⏮"); self.btn_prev.setToolTip("Mídia anterior")
+        self.btn_prev.setText("⏮"); self.btn_prev.setToolTip(t("Previous media"))
         self.btn_prev.clicked.connect(lambda: self._nav_media(-1))
         self.btn_play = QToolButton(); self.btn_play.setObjectName("play")
-        self.btn_play.setText("▶"); self.btn_play.setToolTip("Reproduzir / pausar")
+        self.btn_play.setText("▶"); self.btn_play.setToolTip(t("Play / pause"))
         self.btn_play.clicked.connect(self._toggle_play)
         self.btn_next = QToolButton(); self.btn_next.setObjectName("transport")
-        self.btn_next.setText("⏭"); self.btn_next.setToolTip("Próxima mídia")
+        self.btn_next.setText("⏭"); self.btn_next.setToolTip(t("Next media"))
         self.btn_next.clicked.connect(lambda: self._nav_media(1))
         self.btn_vol = QToolButton(); self.btn_vol.setObjectName("transport")  # B13
         self.btn_vol.setText("🔇" if self.muted else "🔊")
-        self.btn_vol.setToolTip("Mudo (padrão para privacidade) — clique p/ ativar o som")
+        self.btn_vol.setToolTip(t("Muted (default for privacy) — click to enable sound"))
         self.btn_vol.clicked.connect(self._toggle_mute)
         self.lbl_media = QLabel(""); self.lbl_media.setObjectName("medianame")
         self.lbl_media.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -564,7 +644,7 @@ class MainWindow(QMainWindow):
         pal = THEMES[self.theme]
         self.setStyleSheet(build_style(pal))
         self.status.setStyleSheet(f"color:{pal['muted']}; padding:2px 4px;")
-        self.btn_theme.setText("☀  Claro" if self.theme == "dark" else "☾  Escuro")
+        self.btn_theme.setText(t("☀  Light") if self.theme == "dark" else t("☾  Dark"))
         self._refresh_badges(pal)
 
     def toggle_theme(self):
@@ -587,13 +667,13 @@ class MainWindow(QMainWindow):
         if on:
             self.ck_crx.setChecked(False); self.ck_crx.setEnabled(False)
             self.ed_content.setPlaceholderText(
-                "Expressão booleana:   (nota OR laudo) AND paciente NOT rascunho")
+                t("Boolean expression:   (note OR report) AND patient NOT draft"))
             if self.ck_doc.isChecked():           # B6: não combinam
                 self.ck_doc.setChecked(False)
         else:
             self.ck_crx.setEnabled(True)
             self.ed_content.setPlaceholderText(
-                "Conteúdo a conter (texto ou regex)…   — vazio = busca só por nome")
+                t("Content to contain (text or regex)…   — empty = search by name only"))
         # B6: booleano ainda não busca dentro de documentos — um desabilita o outro
         self.ck_doc.setEnabled(not on and bool(engine.RGA))
 
@@ -603,11 +683,56 @@ class MainWindow(QMainWindow):
         self.ck_bool.setEnabled(not on)
 
     def browse(self):
-        d = QFileDialog.getExistingDirectory(self, "Escolha a pasta",
+        d = QFileDialog.getExistingDirectory(self, t("Choose the folder"),
                                              self.ed_path.text().split(";")[0] or os.path.expanduser("~"))
         if d:
             cur = self.ed_path.text().strip()
             self.ed_path.setText(f"{cur};{d}" if cur else d)
+
+    # ---- multidiscos ("Discos ▾")
+    def _paths_list(self):
+        return [p.strip() for p in self.ed_path.text().split(";") if p.strip()]
+
+    def _fill_disks_menu(self):
+        """Monta o menu na hora de abrir: home + discos montados AGORA (pen drive
+        plugado depois da janela aberta aparece). Marcado = já está no 'Em'."""
+        self.mnu_disks.clear()
+        cur = set(self._paths_list())
+        home = os.path.expanduser("~")
+        mounts = engine.user_mounts()
+        # "All disks": marca/desmarca TODOS os discos montados de uma vez
+        if mounts:
+            all_on = all(mp in cur for mp in mounts)
+            aa = self.mnu_disks.addAction(t("All disks"))
+            aa.setCheckable(True); aa.setChecked(all_on)
+            aa.toggled.connect(self._toggle_all_disks)
+            self.mnu_disks.addSeparator()
+        for mp in [home] + mounts:
+            label = t("Home folder (~)") if mp == home else mp
+            a = self.mnu_disks.addAction(label)
+            a.setCheckable(True); a.setChecked(mp in cur)
+            a.toggled.connect(lambda on, mp=mp: self._toggle_path(mp, on))
+        if not mounts:
+            a = self.mnu_disks.addAction(t("(no external disk mounted)"))
+            a.setEnabled(False)
+
+    def _toggle_path(self, mp, on):
+        cur = self._paths_list()
+        if on and mp not in cur:
+            cur.append(mp)
+        elif not on and mp in cur:
+            cur.remove(mp)
+        self.ed_path.setText(";".join(cur))
+
+    def _toggle_all_disks(self, on):
+        """Marca/desmarca todos os discos montados sem tocar em outras pastas
+        que o usuário tenha digitado à mão (ex.: home ou uma subpasta)."""
+        mounts = engine.user_mounts()
+        mset = set(mounts)
+        cur = [p for p in self._paths_list() if p not in mset]   # preserva o resto
+        if on:
+            cur += mounts
+        self.ed_path.setText(";".join(cur))
 
     def _build_query(self) -> Query | None:
         paths = [p.strip() for p in self.ed_path.text().split(";") if p.strip()]
@@ -615,15 +740,16 @@ class MainWindow(QMainWindow):
         bad = [p for p in paths if not os.path.exists(p)]
         paths = [p for p in paths if os.path.exists(p)]
         if not paths:
-            self.status.setText("⚠  Nenhuma pasta válida em 'Em:'.")
+            self.status.setText(t("⚠  No valid folder in 'In:'."))
             return None
         if bad:
-            self.status.setText(f"⚠  Ignorando pasta(s) inexistente(s): {', '.join(bad)}")
+            self.status.setText(t("⚠  Ignoring non-existent folder(s): {paths}", paths=', '.join(bad)))
         name_txt = self.ed_name.text().strip()
         if self.ck_nrx.isChecked():
             name_pats = [name_txt] if name_txt else []
         else:
-            name_pats = [p.strip() for p in name_txt.replace(";", ",").split(",")
+            # texto puro = "contém" (rotina -> *rotina*); glob digitado é respeitado
+            name_pats = [engine.as_name_glob(p) for p in name_txt.replace(";", ",").split(",")
                          if p.strip() and p.strip() != "*"]
         days = self.sp_days.value()
         mod_after = (time.time() - days * 86400) if days > 0 else None
@@ -671,11 +797,11 @@ class MainWindow(QMainWindow):
         else:
             self._hl_terms = []
         modes = []
-        if boolexpr: modes.append("booleano")
-        if q.documents: modes.append("documentos")
+        if boolexpr: modes.append(t("boolean"))
+        if q.documents: modes.append(t("documents"))
         self._mode_tag = f"  ({' + '.join(modes)})" if modes else ""
         self._phase_txt = ""                      # opt#4: passo atual (modo booleano)
-        self.status.setText("Buscando…" + self._mode_tag)
+        self.status.setText(t("Searching…") + self._mode_tag)
         self.worker = SearchWorker(q, boolexpr)
         self.worker.batch.connect(self.model.append)
         self.worker.progress.connect(self.on_progress)
@@ -688,7 +814,7 @@ class MainWindow(QMainWindow):
     def cancel_search(self):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self.status.setText("Cancelando…")
+            self.status.setText(t("Cancelling…"))
 
     def closeEvent(self, ev):
         """B5: fechar no meio de uma busca não pode derrubar o processo.
@@ -706,21 +832,22 @@ class MainWindow(QMainWindow):
     def _heartbeat(self):
         """B8: atualiza o status independentemente de lotes (busca longa não 'trava')."""
         d = self._denied()
-        extra = f" · {d} inacessível(is)" if d else ""
+        extra = t(" · {d} inaccessible", d=d) if d else ""
         ph = getattr(self, "_phase_txt", "")
         step = f" · {ph}" if ph else ""           # opt#4: passo booleano atual
-        self.status.setText(f"Buscando…{self._mode_tag}  {len(self.model.rows)} encontrados "
-                            f"· {time.time()-self.t0:.1f}s{extra}{step}")
+        self.status.setText(t("Searching…{tag}  {n} found · {sec}s{extra}{step}",
+                              tag=self._mode_tag, n=len(self.model.rows),
+                              sec=f"{time.time()-self.t0:.1f}", extra=extra, step=step))
 
     def on_phase(self, done, total, label):
         """Opt#4: recebe 'passo done/total: label' do motor booleano e mostra no status."""
-        self._phase_txt = f"passo {done}/{total}: {label}"
+        self._phase_txt = t("step {done}/{total}: {label}", done=done, total=total, label=label)
         self._heartbeat()
 
     def on_error(self, msg):
         self._tick.stop()
         self.btn_search.setEnabled(True); self.btn_cancel.setEnabled(False)
-        self.status.setText(f"⚠  Expressão booleana inválida: {msg}")
+        self.status.setText(t("⚠  Invalid boolean expression: {msg}", msg=msg))
 
     def on_progress(self, n):
         self._heartbeat()
@@ -733,9 +860,16 @@ class MainWindow(QMainWindow):
         cancelled = self.worker and self.worker._cancel
         icon = "■" if cancelled else "✔"
         d = self._denied()
-        extra = f"  ·  {d} inacessível(is)" if d else ""
-        self.status.setText(f"{icon}  {tot} resultado(s)  ·  {dt:.2f}s" + extra
-                            + ("   (cancelado)" if cancelled else ""))
+        extra = t("  ·  {d} inaccessible", d=d) if d else ""
+        cancel = t("   (cancelled)") if cancelled else ""
+        # dica: zero resultados COM Conteúdo preenchido = quase sempre o usuário
+        # quis buscar por NOME (ex.: digitou "*.mp4" no Conteúdo). Aponta o caminho.
+        tip = ""
+        if tot == 0 and not cancelled and self.ed_content.text().strip():
+            tip = t("   —  tip: “Content” is filled, so this searched INSIDE files; "
+                    "clear it to match file/folder names.")
+        self.status.setText(t("{icon}  {tot} result(s)  ·  {sec}s{extra}{cancel}",
+                              icon=icon, tot=tot, sec=f"{dt:.2f}", extra=extra, cancel=cancel) + tip)
 
     # ---- mapeamento proxy (visual) -> source (dados)
     def _match_at_proxy(self, row: int):
@@ -827,7 +961,7 @@ class MainWindow(QMainWindow):
         self.btn_vol.setEnabled(playable and HAS_MEDIA)
         if not playable:
             self.sld_pos.setRange(0, 0)
-            self.lbl_time.setText("imagem")
+            self.lbl_time.setText(t("image"))
 
     def _toggle_mute(self):
         """B13: liga/desliga o som e persiste a escolha no config."""
@@ -855,7 +989,7 @@ class MainWindow(QMainWindow):
         # decodificam o raster inteiro antes de escalar e congelariam a UI num SMR.
         if sz > self._IMG_CAP:
             self.img_label.setPixmap(QPixmap())
-            self.img_label.setText("imagem muito grande —\nclique duplo p/ abrir externo")
+            self.img_label.setText(t("image too large —\ndouble-click to open externally"))
             return
         reader = QImageReader(path)
         reader.setAutoTransform(True)
@@ -867,7 +1001,7 @@ class MainWindow(QMainWindow):
         img = reader.read()
         if img.isNull():
             self.img_label.setPixmap(QPixmap())
-            self.img_label.setText("(sem pré-visualização de imagem)")
+            self.img_label.setText(t("(no image preview)"))
             return
         self._orig_pixmap = QPixmap.fromImage(img)
         self.img_label.setText("")
@@ -949,14 +1083,14 @@ class MainWindow(QMainWindow):
                 lines = []
                 for i, line in enumerate(f, 1):
                     if "\x00" in line:
-                        return "(arquivo binário — sem preview de texto)"
+                        return t("(binary file — no text preview)")
                     lines.append(f"{i:>5}: {line.rstrip()}")
                     if i >= n:
-                        lines.append("   … (truncado)")
+                        lines.append(t("   … (truncated)"))
                         break
-                return "\n".join(lines) if lines else "(vazio)"
+                return "\n".join(lines) if lines else t("(empty)")
         except OSError as e:
-            return f"(sem preview: {e})"
+            return t("(no preview: {e})", e=e)
 
     # ---- contexto
     def _sel_matches(self):
@@ -976,16 +1110,16 @@ class MainWindow(QMainWindow):
         ms = self._sel_matches()
         if ms:
             QGuiApplication.clipboard().setText("\n".join(m.path for m in ms))
-            self.status.setText(f"{len(ms)} caminho(s) copiado(s).")
+            self.status.setText(t("{n} path(s) copied.", n=len(ms)))
 
     def context_menu(self, pos):
         if not self.table.selectionModel().hasSelection():
             return
         mnu = QMenu(self)
-        mnu.addAction("Abrir arquivo", self.open_file)
-        mnu.addAction("Abrir pasta", self.open_folder)
+        mnu.addAction(t("Open file"), self.open_file)
+        mnu.addAction(t("Open folder"), self.open_folder)
         mnu.addSeparator()
-        mnu.addAction("Copiar caminho(s)", self.copy_paths)
+        mnu.addAction(t("Copy path(s)"), self.copy_paths)
         mnu.exec(self.table.viewport().mapToGlobal(pos))
 
 

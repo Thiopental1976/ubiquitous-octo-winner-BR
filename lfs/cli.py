@@ -10,7 +10,9 @@ from engine import Query
 def main():
     ap = argparse.ArgumentParser(description="Busca ampla de arquivos (nome + conteúdo) sobre ripgrep/fd.")
     ap.add_argument("path", nargs="+", help="pasta(s) onde buscar")
-    ap.add_argument("-n", "--name", default="", help="glob(s) de nome, separados por vírgula (ex: '*.py,*.txt')")
+    ap.add_argument("-n", "--name", default="",
+                    help="nome CONTÉM o termo ('rotina' acha 'exames de rotina.txt'); "
+                         "globs (* ? [) valem como digitados; vários separados por vírgula")
     ap.add_argument("-c", "--content", default="", help="texto/regex que o arquivo deve conter")
     ap.add_argument("-b", "--bool", dest="boolexpr", default="", metavar="EXPR",
                     help="busca BOOLEANA de conteúdo: '(A OR B) AND C NOT D' (| & ! e aspas)")
@@ -32,7 +34,9 @@ def main():
 
     parse_size = engine.parse_size            # §5: fonte única (era duplicado)
 
-    names = [p.strip() for p in args.name.replace(";", ",").split(",") if p.strip()] if not args.name_regex else ([args.name] if args.name else [])
+    # texto puro = "contém" (mesma semântica da GUI); glob explícito é respeitado
+    names = [engine.as_name_glob(p) for p in args.name.replace(";", ",").split(",")
+             if p.strip()] if not args.name_regex else ([args.name] if args.name else [])
     q = Query(
         paths=args.path, name_patterns=names, name_is_regex=args.name_regex,
         content=args.content, content_is_regex=args.content_regex,

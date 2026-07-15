@@ -43,6 +43,27 @@ def engine_info():
     }
 
 
+def user_mounts(lines=None):
+    """Pontos de montagem 'de usuário' — discos externos/acervo: dispositivos
+    reais (/dev/*) montados sob /media, /mnt ou /run/media. São os candidatos
+    da busca MULTIDISCOS na GUI ("Discos ▾"). `lines` injetável p/ teste."""
+    if lines is None:
+        try:
+            with open("/proc/mounts", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return []
+    out = set()
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].startswith("/dev/"):
+            continue
+        mp = parts[1].replace("\\040", " ")     # espaço vem escapado no mounts
+        if mp.startswith(("/media/", "/mnt/", "/run/media/")):
+            out.add(mp)
+    return sorted(out)
+
+
 # ---------------------------------------------------------------- utilidades
 def _reap(proc, errf=None, stats=None):
     """Encerra o subprocesso SEM deixar órfão (B1) e conta 'inacessíveis' do
@@ -87,6 +108,19 @@ def parse_size(s):
         return int(float(s) * mult)
     except ValueError:
         return None
+
+
+_GLOB_META = frozenset("*?[")
+
+def as_name_glob(term: str) -> str:
+    """Entrada crua do usuário no campo de NOME -> glob de basename, estilo
+    Agent Ransack/Windows: texto puro significa 'contém' — "rotina" vira
+    "*rotina*" e acha "exames de rotina.txt", qualquer extensão. Quem digita
+    metacaracteres (* ? [) está pedindo glob literal e mantém o controle."""
+    t = term.strip()
+    if not t or _GLOB_META & set(t):
+        return t
+    return f"*{t}*"
 
 
 # ---------------------------------------------------------------- parâmetros
@@ -186,6 +220,19 @@ def _iter_names_python(q: Query, stats=None):
                     except OSError:
                         pass
                 dns[:] = keep
+            # pastas também casam por nome (busca só-por-nome; dir não tem conteúdo).
+            # Feito com a lista JÁ podada (ocultos/one-fs), antes do corte de recursão.
+            for d in dns:
+                if not match_name(d):
+                    continue
+                dpp = os.path.join(dp, d)
+                try:
+                    st = os.stat(dpp)
+                except OSError:
+                    continue
+                if not _passes_meta(q, st):
+                    continue
+                yield Match(dpp, st.st_size, st.st_mtime, is_dir=True)
             if not q.recursive:
                 dns[:] = []
             elif q.max_depth is not None and depth >= q.max_depth:
@@ -268,7 +315,9 @@ def _iter_names_fd(q: Query, cancel, stats=None):
             use_glob = False                      # agora é regex, não glob
     seen = set() if len(pats) > 1 else None   # dedup só faz sentido com múltiplos padrões
     for pat in pats:
-        cmd = [FD, "--absolute-path", "--type", "f"]
+        # arquivos E pastas (e symlinks): busca só-por-nome acha "Argentina/" como
+        # pasta e "argentina.txt" como arquivo — dir não tem conteúdo p/ filtrar.
+        cmd = [FD, "--absolute-path", "--type", "f", "--type", "d", "--type", "l"]
         if not q.respect_gitignore:
             cmd.append("--no-ignore")
         if q.include_hidden:
@@ -311,7 +360,7 @@ def _iter_names_fd(q: Query, cancel, stats=None):
                     continue
                 if not _passes_meta(q, st):
                     continue
-                yield Match(fp, st.st_size, st.st_mtime)
+                yield Match(fp, st.st_size, st.st_mtime, is_dir=stat.S_ISDIR(st.st_mode))
         finally:
             _reap(proc, errf, stats)              # B1/B8: mata processo + conta inacessíveis
 

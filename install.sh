@@ -70,6 +70,17 @@ sys_install() {   # sys_install <chave-logica> <binario-p/-checar>
   if $INSTALL "$p"; then ok "$p instalado"; else wn "falhou instalar $p — siga sem ele"; fi
 }
 
+# o repositório desta distro conhece o pacote? (evita tentar instalar em vão)
+pkg_exists() {
+  case "$PM" in
+    apt)    apt-cache show "$1" >/dev/null 2>&1;;
+    dnf)    dnf -q info "$1" >/dev/null 2>&1;;
+    pacman) pacman -Si "$1" >/dev/null 2>&1;;
+    zypper) zypper -q info "$1" >/dev/null 2>&1;;
+    *)      return 1;;
+  esac
+}
+
 # -------------------------------------------------- binário estático (rga/pandoc)
 dl() { # dl <url> <destino>
   if has curl; then curl -fsSL --retry 3 "$1" -o "$2"
@@ -117,22 +128,72 @@ install_pandoc() {
 
 # -------------------------------------------------- Python + PySide6
 PYBIN=""
+
+# Qt >= 6.5 (o PySide6 do pip) exige a libxcb-cursor do SISTEMA p/ abrir em X11 —
+# o pip não empacota libs de sistema. Sem ela a GUI aborta no arranque com
+# "Could not load the Qt platform plugin xcb". Pacotes da distro (python3-pyside6
+# etc.) puxam-na por dependência; o caminho do venv precisa garantir na mão.
+ensure_qt_xcb() {
+  # grep SEM -q: com pipefail, o -q sai no 1º match e o SIGPIPE no ldconfig
+  # derruba o pipeline — a lib presente pareceria ausente
+  ldconfig -p 2>/dev/null | grep 'libxcb-cursor\.so\.0' >/dev/null && return 0
+  if [ -z "$PM" ]; then
+    wn "libxcb-cursor ausente — sem ela a GUI não abre em X11; instale pela sua distro"; return 1
+  fi
+  local p; case "$PM" in
+    dnf|pacman) p=xcb-util-cursor;;
+    *)          p=libxcb-cursor0;;      # apt/zypper
+  esac
+  c "Instalando $p (plugin xcb do Qt p/ a GUI)…"
+  if $INSTALL "$p"; then ok "$p instalado"; else wn "falhou instalar $p — a GUI pode não abrir em X11"; fi
+}
+
+# venv de verdade exige o ensurepip, que em Debian/Mint vem em pacote SEPARADO
+# (python3.X-venv). Atenção: `python3 -m venv --help` funciona mesmo SEM ele, e o
+# binário `python3` sempre existe — nenhum dos dois serve de teste. Quem falta é o
+# ensurepip, então é ele que checamos.
+ensure_venv_pkg() {
+  python3 -c "import ensurepip" >/dev/null 2>&1 && return 0
+  if [ -z "$PM" ]; then
+    wn "ensurepip ausente e sem gerenciador de pacotes — instale o venv da sua distro"; return 1
+  fi
+  local pv; pv="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  c "Instalando suporte a venv (ensurepip ausente)…"
+  local p                                  # $pv já vem como "3.12" -> python3.12-venv
+  for p in ${pv:+"python$pv-venv"} python3-venv; do
+    pkg_exists "$p" || continue
+    $INSTALL "$p" || continue
+    if python3 -c "import ensurepip" >/dev/null 2>&1; then ok "$p instalado"; return 0; fi
+  done
+  wn "não consegui habilitar o venv — instale manualmente (ex.: python$pv-venv)"; return 1
+}
+
 setup_python() {
   if python3 -c "import PySide6" >/dev/null 2>&1; then
     PYBIN="$(command -v python3)"; ok "PySide6 do sistema OK"; return
   fi
-  # tenta o pacote PySide6 da distro (traz QtMultimedia p/ o player)
-  if [ -n "$PM" ] && ask "Instalar PySide6 pelo gerenciador ($(pkg pyside6))?"; then
+  # tenta o pacote PySide6 da distro (traz QtMultimedia p/ o player).
+  # Nem toda distro tem: Ubuntu noble/Mint 22.x só empacotam PySide2 (Qt5) — aí
+  # nem tentamos, pra não poluir a saída com um erro esperado, e vamos de venv.
+  # (recusa no prompt ≠ pacote inexistente: cada caso tem sua mensagem)
+  if [ -n "$PM" ] && ! pkg_exists "$(pkg pyside6)"; then
+    wn "$(pkg pyside6) não existe no repositório desta distro — usando venv."
+  elif [ -n "$PM" ] && ask "Instalar PySide6 pelo gerenciador ($(pkg pyside6))?"; then
     $INSTALL "$(pkg pyside6)" || true
     if python3 -c "import PySide6" >/dev/null 2>&1; then
       PYBIN="$(command -v python3)"; ok "PySide6 do sistema OK"; return
     fi
     wn "PySide6 do sistema não ficou disponível — caindo para venv."
   fi
-  c "Criando ambiente próprio (venv) com PySide6…"
-  if ! python3 -m venv --help >/dev/null 2>&1; then
-    sys_install python3-venv python3    # Debian/Mint: pacote separado
+  ensure_qt_xcb || true            # PySide6 do pip: garante o xcb do sistema (GUI)
+  # venv anterior que já funciona: reaproveita (re-rodar o instalador não deve
+  # rebaixar ~250 MB de PySide6 à toa)
+  if [ -x "$PREFIX/venv/bin/python" ] && "$PREFIX/venv/bin/python" -c "import PySide6" >/dev/null 2>&1; then
+    PYBIN="$PREFIX/venv/bin/python"; ok "venv com PySide6 já existe — reaproveitado"; return
   fi
+  c "Criando ambiente próprio (venv) com PySide6…"
+  ensure_venv_pkg || true          # se falhar, o venv abaixo dirá o porquê
+  rm -rf "$PREFIX/venv"            # só aqui: venv ausente ou quebrado (ex.: sem ensurepip)
   python3 -m venv "$PREFIX/venv"
   "$PREFIX/venv/bin/pip" install --upgrade pip >/dev/null
   c "Instalando PySide6 no venv (pode baixar ~100 MB)…"
