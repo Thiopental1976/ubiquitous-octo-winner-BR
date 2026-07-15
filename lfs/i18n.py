@@ -158,6 +158,7 @@ _PT = {
     "missing ')'": "parêntese ')' faltando",
     "expected a term, got {tok}": "esperava termo, veio {tok}",
     "unknown node": "nó desconhecido",
+    "expression too deeply nested": "expressão aninhada em excesso",
 }
 
 # Source is English; only non-English languages need a table.

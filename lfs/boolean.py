@@ -143,7 +143,10 @@ class _P:
 
 
 def parse(expr: str):
-    return _P(tokenize(expr)).parse()
+    try:
+        return _P(tokenize(expr)).parse()
+    except RecursionError:                  # B2: aninhamento absurdo de parênteses não
+        raise BooleanError(t("expression too deeply nested"))   # pode virar crash não tratado
 
 
 def positive_terms(node) -> list[str]:
@@ -158,8 +161,8 @@ def positive_terms(node) -> list[str]:
     walk(node, False)
     # únicos preservando ordem
     seen = set(); uniq = []
-    for t in out:
-        if t not in seen: seen.add(t); uniq.append(t)
+    for term in out:                       # B6: não sombrear o tradutor t()
+        if term not in seen: seen.add(term); uniq.append(term)
     return uniq
 
 
@@ -556,7 +559,7 @@ def _display_lines(pos_terms, files, q: engine.Query, cancel, stats=None) -> dic
         return {}
     base = _rg_base(q) + ["--json"]
     if not q.content_is_regex: base.append("--fixed-strings")
-    for t in pos_terms: base += ["-e", t]
+    for term in pos_terms: base += ["-e", term]   # B6: não sombrear o tradutor t()
     res: dict = {}
     for i in range(0, len(files), _BATCH):
         if cancel(): break

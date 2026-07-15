@@ -817,12 +817,22 @@ class MainWindow(QMainWindow):
             self.status.setText(t("Cancelling…"))
 
     def closeEvent(self, ev):
-        """B5: fechar no meio de uma busca não pode derrubar o processo.
-        Cancela o worker e espera a thread sair antes de aceitar o fechamento."""
+        """B5/A1: fechar no meio de uma busca não pode derrubar o processo.
+        Destruir um QThread ainda rodando aborta o app (e órfã o rg/fd), então
+        esperamos a thread SAIR de fato antes de aceitar o fechamento. Bombeamos
+        eventos p/ a UI não congelar; após um teto generoso (o cancelamento já é
+        checado a cada bloco/linha, então some em ~1s), forçamos como último recurso."""
         self._tick.stop()
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait(3000)
+            deadline = time.time() + 8.0
+            while self.worker.isRunning() and time.time() < deadline:
+                if self.worker.wait(100):
+                    break
+                QApplication.processEvents()
+            if self.worker.isRunning():           # não saiu graciosamente: evita o
+                self.worker.terminate()           # abort do destrutor de QThread
+                self.worker.wait(2000)
         self._stop_media()
         super().closeEvent(ev)
 
@@ -856,6 +866,11 @@ class MainWindow(QMainWindow):
         self._tick.stop()
         self._phase_txt = ""                      # opt#4: fim das fases
         self.btn_search.setEnabled(True); self.btn_cancel.setEnabled(False)
+        # A3: habilitar ordenação dispara um sort imediato pela coluna do indicador
+        # (default = coluna 0 "Arquivo"), que embaralharia a ordem de chegada que o
+        # usuário viu preencher. Zera o indicador antes p/ manter a ordem natural;
+        # clicar num cabeçalho continua ordenando normalmente.
+        self.table.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         self.table.setSortingEnabled(True)        # B14: colunas ordenáveis ao fim
         cancelled = self.worker and self.worker._cancel
         icon = "■" if cancelled else "✔"

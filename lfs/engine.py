@@ -105,9 +105,10 @@ def parse_size(s):
         if s.endswith(suf):
             s = s[:-len(suf)]; mult = m; break
     try:
-        return int(float(s) * mult)
+        n = int(float(s) * mult)
     except ValueError:
         return None
+    return n if n >= 0 else None          # tamanho negativo não faz sentido -> ignora filtro
 
 
 _GLOB_META = frozenset("*?[")
@@ -195,10 +196,19 @@ def _walk_onerror(stats):
     return cb
 
 
-def _iter_names_python(q: Query, stats=None):
+def _iter_names_python(q: Query, stats=None, cancel=None):
     """Fallback universal: os.walk com profundidade/hidden/symlink/meta/one-fs.
     N2: `stats` recebe 'denied' de diretórios sem permissão (onerror do os.walk)."""
     match_name = _name_matcher(q)
+    # profundidade efetiva no MESMO sentido que o fd (--max-depth N conta filhos
+    # diretos como 1). Uma entrada dentro de um dir de `depth` d tem fd-depth d+1,
+    # então incluímos só quando depth < eff_max (senão o fallback casava um nível
+    # a mais que o fd/rg — divergência de backend).
+    if not q.recursive:
+        eff_max = 1
+    else:
+        eff_max = q.max_depth
+    seen_dirs = set() if q.follow_symlinks else None   # E4: corta laço de symlink
     for root in q.paths:
         root = os.path.abspath(os.path.expanduser(root))
         base_depth = root.rstrip("/").count("/")
@@ -208,7 +218,19 @@ def _iter_names_python(q: Query, stats=None):
             except OSError: root_dev = None
         for dp, dns, fns in os.walk(root, followlinks=q.follow_symlinks,
                                     onerror=_walk_onerror(stats)):
+            if cancel and cancel():                 # E10: honra cancelamento no fallback
+                return
             depth = dp.rstrip("/").count("/") - base_depth
+            if seen_dirs is not None:               # E4: não revisita dir já visto (ciclo)
+                try:
+                    st_dp = os.stat(dp)
+                    key = (st_dp.st_dev, st_dp.st_ino)
+                    if key in seen_dirs:
+                        dns[:] = []
+                        continue
+                    seen_dirs.add(key)
+                except OSError:
+                    pass
             if not q.include_hidden:
                 dns[:] = [d for d in dns if not d.startswith(".")]
             if root_dev is not None:
@@ -220,36 +242,45 @@ def _iter_names_python(q: Query, stats=None):
                     except OSError:
                         pass
                 dns[:] = keep
+            emit_here = eff_max is None or depth < eff_max   # E3: gate por profundidade
             # pastas também casam por nome (busca só-por-nome; dir não tem conteúdo).
             # Feito com a lista JÁ podada (ocultos/one-fs), antes do corte de recursão.
-            for d in dns:
-                if not match_name(d):
-                    continue
-                dpp = os.path.join(dp, d)
-                try:
-                    st = os.stat(dpp)
-                except OSError:
-                    continue
-                if not _passes_meta(q, st):
-                    continue
-                yield Match(dpp, st.st_size, st.st_mtime, is_dir=True)
+            if emit_here:
+                for d in dns:
+                    if not match_name(d):
+                        continue
+                    dpp = os.path.join(dp, d)
+                    try:
+                        st = os.stat(dpp)
+                    except OSError:
+                        try:
+                            st = os.lstat(dpp)      # E5: symlink de dir quebrado
+                        except OSError:
+                            continue
+                    if not _passes_meta(q, st):
+                        continue
+                    yield Match(dpp, st.st_size, st.st_mtime, is_dir=True)
             if not q.recursive:
                 dns[:] = []
             elif q.max_depth is not None and depth >= q.max_depth:
                 dns[:] = []
-            for f in fns:
-                if not q.include_hidden and f.startswith("."):
-                    continue
-                if not match_name(f):
-                    continue
-                fp = os.path.join(dp, f)
-                try:
-                    st = os.stat(fp)
-                except OSError:
-                    continue
-                if not _passes_meta(q, st):
-                    continue
-                yield Match(fp, st.st_size, st.st_mtime)
+            if emit_here:
+                for f in fns:
+                    if not q.include_hidden and f.startswith("."):
+                        continue
+                    if not match_name(f):
+                        continue
+                    fp = os.path.join(dp, f)
+                    try:
+                        st = os.stat(fp)
+                    except OSError:
+                        try:
+                            st = os.lstat(fp)       # E5: symlink quebrado casa por nome
+                        except OSError:
+                            continue
+                    if not _passes_meta(q, st):
+                        continue
+                    yield Match(fp, st.st_size, st.st_mtime)
 
 
 _MERGE_GLOBS_MIN = 4                      # opt#3: >3 globs -> funde numa regex só
@@ -337,34 +368,57 @@ def _iter_names_fd(q: Query, cancel, stats=None):
         elif q.name_patterns and q.case_sensitive:
             cmd.append("--case-sensitive")        # N1: fd usa smart-case; força sensível
         pat_val = pat if q.name_patterns else "."
+        cmd.append("--print0")                    # E1: saída NUL-delimitada — nome com
+                                                  # '\n' não vira 2 registros (perda/fantasma)
         cmd += ["--", pat_val] + q.paths          # B10: '--' encerra as opções
         errf = tempfile.TemporaryFile(mode="w+")
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
-                                    text=True, errors="replace")
+            # binário (sem text=): lê bytes e decodifica com surrogateescape p/
+            # sobreviver a nomes não-UTF-8 (E2) — o str resultante volta pro os.stat.
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
         except OSError:
             errf.close()
-            yield from _iter_names_python(q); return
+            yield from _iter_names_python(q, stats, cancel); return
         try:
-            for line in proc.stdout:
+            buf = b""
+            read1 = getattr(proc.stdout, "read1", proc.stdout.read)
+            while True:
                 if cancel():
                     return
-                fp = line.rstrip("\n")
-                if len(fp) > 1:
-                    fp = fp.rstrip("/")   # fd emite "dir/" com barra final — ela
-                                          # quebra os.path.basename() na GUI (nome
-                                          # vazio). Guarda len>1 preserva a raiz "/".
-                if not fp or (seen is not None and fp in seen):
-                    continue
-                if seen is not None:
-                    seen.add(fp)
-                try:
-                    st = os.stat(fp)
-                except OSError:
-                    continue
-                if not _passes_meta(q, st):
-                    continue
-                yield Match(fp, st.st_size, st.st_mtime, is_dir=stat.S_ISDIR(st.st_mode))
+                chunk = read1(65536)
+                if chunk:
+                    buf += chunk
+                    parts = buf.split(b"\0")
+                    buf = parts.pop()             # trecho incompleto fica p/ próxima
+                else:
+                    parts = [buf] if buf else []  # EOF: drena o resto (normalmente vazio)
+                    buf = b""
+                for raw in parts:
+                    if not raw:
+                        continue
+                    fp = os.fsdecode(raw)         # E2: surrogateescape p/ nomes crus
+                    if len(fp) > 1:
+                        fp = fp.rstrip("/")   # fd emite "dir/" com barra final — ela
+                                              # quebra os.path.basename() na GUI (nome
+                                              # vazio). Guarda len>1 preserva a raiz "/".
+                    if not fp or (seen is not None and fp in seen):
+                        continue
+                    if seen is not None:
+                        seen.add(fp)
+                    try:
+                        st = os.stat(fp)
+                        is_dir = stat.S_ISDIR(st.st_mode)
+                    except OSError:
+                        try:
+                            st = os.lstat(fp)    # E5: symlink quebrado — mostra o link
+                        except OSError:
+                            continue
+                        is_dir = False
+                    if not _passes_meta(q, st):
+                        continue
+                    yield Match(fp, st.st_size, st.st_mtime, is_dir=is_dir)
+                if not chunk:
+                    break
         finally:
             _reap(proc, errf, stats)              # B1/B8: mata processo + conta inacessíveis
 
@@ -468,7 +522,7 @@ def _iter_content_python(q: Query, cancel, stats=None):
     if q.whole_word and not q.content_is_regex:
         rx = re.compile(r"\b" + re.escape(q.content) + r"\b",
                         0 if q.case_sensitive else re.IGNORECASE)
-    for m in _iter_names_python(q, stats):
+    for m in _iter_names_python(q, stats, cancel):
         if cancel():
             return
         try:
@@ -509,7 +563,7 @@ def search(q: Query, on_result: Callable[[Match], None],
         else:
             it = _iter_content_python(q, cancel, stats)
     else:
-        it = _iter_names_fd(q, cancel, stats) if FD else _iter_names_python(q, stats)
+        it = _iter_names_fd(q, cancel, stats) if FD else _iter_names_python(q, stats, cancel)
     for m in it:
         if cancel():
             break

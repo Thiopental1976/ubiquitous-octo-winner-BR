@@ -38,7 +38,8 @@ def test_parse_size():
     assert engine.parse_size("512") == 512
     assert engine.parse_size("") is None
     assert engine.parse_size("xxx") is None
-    print("ok  parse_size (fonte única engine.parse_size)")
+    assert engine.parse_size("-5M") is None       # E9: tamanho negativo -> ignora filtro
+    print("ok  parse_size (fonte única engine.parse_size; negativo->None)")
 
 
 # ------------------------------------------------------------------ B1 _reap
@@ -610,6 +611,116 @@ def test_name_search_includes_dirs():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_name_newline_in_filename():
+    """E1: nome de arquivo com '\\n' não pode virar 2 registros na saída do fd.
+    Antes (fd sem --print0) o arquivo sumia (falso negativo) ou casava caminho errado."""
+    d = tempfile.mkdtemp(prefix="lfs_nl_")
+    try:
+        target = os.path.join(d, "linha1\nlinha2.txt")
+        with open(target, "w") as f:
+            f.write("x")
+        open(os.path.join(d, "normal.txt"), "w").close()
+
+        def run(use_fd):
+            old = engine.FD
+            if not use_fd:
+                engine.FD = None
+            try:
+                q = Query(paths=[d], name_patterns=[engine.as_name_glob("linha")],
+                          include_hidden=True)
+                got = []
+                engine.search(q, lambda m: got.append(m.path), lambda: False)
+                return got
+            finally:
+                engine.FD = old
+
+        for use_fd in ((True, False) if engine.FD else (False,)):
+            got = run(use_fd)
+            tag = "fd" if use_fd else "python"
+            assert target in got, (tag, got)      # o arquivo real, intacto
+            assert len(got) == 1, (tag, got)      # sem fragmentos-fantasma
+        print("ok  E1  nome com '\\n' sobrevive (fd --print0; sem fantasma)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_name_broken_symlink():
+    """E5: symlink quebrado casado por nome não pode ser descartado (os.stat falha
+    no alvo -> antes sumia; agora cai no os.lstat e aparece)."""
+    d = tempfile.mkdtemp(prefix="lfs_ln_")
+    try:
+        os.symlink("/nao/existe/mesmo", os.path.join(d, "link_orfao"))
+
+        def run(use_fd):
+            old = engine.FD
+            if not use_fd:
+                engine.FD = None
+            try:
+                q = Query(paths=[d], name_patterns=[engine.as_name_glob("link_orfao")],
+                          include_hidden=True)
+                got = []
+                engine.search(q, lambda m: got.append(os.path.basename(m.path)), lambda: False)
+                return got
+            finally:
+                engine.FD = old
+
+        for use_fd in ((True, False) if engine.FD else (False,)):
+            got = run(use_fd)
+            tag = "fd" if use_fd else "python"
+            assert "link_orfao" in got, (tag, got)
+        print("ok  E5  symlink quebrado casa por nome (fd e python)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_max_depth_backend_parity():
+    """E3: fallback os.walk casava um nível a mais que o fd (--max-depth conta filhos
+    diretos como 1). fd e python devem devolver o MESMO conjunto por profundidade."""
+    if not engine.FD:
+        print("ok  E3  (fd ausente — paridade de profundidade não testável)")
+        return
+    d = tempfile.mkdtemp(prefix="lfs_dp_")
+    try:
+        os.makedirs(os.path.join(d, "a", "b", "c"))
+        open(os.path.join(d, "raiz.txt"), "w").close()
+        open(os.path.join(d, "a", "n1.txt"), "w").close()
+        open(os.path.join(d, "a", "b", "n2.txt"), "w").close()
+        open(os.path.join(d, "a", "b", "c", "n3.txt"), "w").close()
+
+        def run(use_fd, md):
+            old = engine.FD
+            if not use_fd:
+                engine.FD = None
+            try:
+                q = Query(paths=[d], name_patterns=[], include_hidden=True, max_depth=md)
+                got = []
+                engine.search(q, lambda m: got.append(os.path.relpath(m.path, d)), lambda: False)
+                return set(got)
+            finally:
+                engine.FD = old
+
+        for md in (1, 2, 3):
+            fd = run(True, md); py = run(False, md)
+            assert fd == py, (md, "fd^py=", sorted(fd ^ py))
+        print("ok  E3  profundidade: fd e python concordam (max_depth 1..3)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_boolean_deep_nesting():
+    """B2: aninhamento absurdo de parênteses vira BooleanError, não RecursionError."""
+    try:
+        boolean.parse("(" * 5000 + "A" + ")" * 5000)
+        raise AssertionError("não levantou erro em expressão fundíssima")
+    except boolean.BooleanError:
+        pass
+    except RecursionError:
+        raise AssertionError("RecursionError escapou (deveria virar BooleanError)")
+    # expressão rasa segue funcionando
+    boolean.parse("(a OR b) AND c NOT d")
+    print("ok  B2  parênteses fundíssimos -> BooleanError (sem RecursionError)")
+
+
 def main():
     fns = [test_parse_size, test_reap_kills_process, test_no_orphan_on_cancel,
            test_glob_case_insensitive, test_boolean_name_regex,
@@ -623,7 +734,9 @@ def main():
            test_on_phase_reports, test_on_phase_optional,
            test_walk_onerror_counts_denied, test_boolean_stats_denied,
            test_i18n_mechanism, test_i18n_no_stale_keys,
-           test_name_search_includes_dirs]
+           test_name_search_includes_dirs,
+           test_name_newline_in_filename, test_name_broken_symlink,
+           test_max_depth_backend_parity, test_boolean_deep_nesting]
     fail = 0
     for fn in fns:
         try:
