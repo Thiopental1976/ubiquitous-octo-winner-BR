@@ -350,6 +350,10 @@ def _iter_names_fd(q: Query, cancel, stats=None):
                 if cancel():
                     return
                 fp = line.rstrip("\n")
+                if len(fp) > 1:
+                    fp = fp.rstrip("/")   # fd emite "dir/" com barra final — ela
+                                          # quebra os.path.basename() na GUI (nome
+                                          # vazio). Guarda len>1 preserva a raiz "/".
                 if not fp or (seen is not None and fp in seen):
                     continue
                 if seen is not None:

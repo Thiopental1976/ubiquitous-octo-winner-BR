@@ -596,6 +596,10 @@ def test_name_search_includes_dirs():
             dirs = {os.path.relpath(m.path, d) for m in got if m.is_dir}
             files = {os.path.relpath(m.path, d) for m in got if not m.is_dir}
             tag = "fd" if use_fd else "python"
+            # relpath NORMALIZA a barra final e mascararia o bug; a GUI usa
+            # basename — é o basename que tem de funcionar ("dir/" do fd => "")
+            assert all(os.path.basename(m.path) for m in got), \
+                (tag, [m.path for m in got])
             assert "ARGENTINA" in dirs, (tag, dirs)
             assert "Pasta_argentina_casting" in dirs, (tag, dirs)
             assert "relatorio_Argentina.txt" in files, (tag, files)
