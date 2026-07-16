@@ -167,14 +167,17 @@ def positive_terms(node) -> list[str]:
 
 
 # ------------------------------------------------------------------ conjuntos de arquivos por termo
-def _rg_base(q: engine.Query):
+def _rg_base(q: engine.Query, matching: bool = True):
+    """Flags comuns do rg. `matching=False` (usado pelo universo do NOT) omite as
+    flags de CASAMENTO de conteúdo (--word-regexp) — o universo lista todo arquivo
+    de texto com padrão vazio, e --word-regexp quebraria esse padrão."""
     cmd = [engine.RG]
     if not q.respect_gitignore: cmd.append("--no-ignore")
     if q.include_hidden:        cmd.append("--hidden")
     if q.follow_symlinks:       cmd.append("--follow")
     if q.one_file_system:       cmd.append("--one-file-system")
     if not q.case_sensitive:    cmd.append("--ignore-case")
-    if q.whole_word:            cmd.append("--word-regexp")
+    if matching and q.whole_word: cmd.append("--word-regexp")
     if not q.recursive:         cmd += ["--max-depth", "1"]
     elif q.max_depth is not None: cmd += ["--max-depth", str(q.max_depth)]
     if q.name_patterns and not q.name_is_regex:
@@ -238,10 +241,26 @@ def _files_with_term_py(term: str, q: engine.Query, cancel, stats=None) -> set[s
     return res
 
 
+def _is_probably_text(path: str, _chunk: int = 8192) -> bool:
+    """B1 (fallback): heurística barata igual à do rg — arquivo é 'texto' se os
+    primeiros KB não têm byte NUL. Usado só quando rg está ausente (universo do
+    NOT deve ser só-texto, o mesmo domínio dos conjuntos de termo)."""
+    try:
+        with open(path, "rb") as fh:
+            return b"\x00" not in fh.read(_chunk)
+    except OSError:
+        return False
+
+
 def _universe(q: engine.Query, cancel, stats=None) -> set[str]:
-    """Todos os arquivos candidatos (p/ resolver NOT). rg --files ou fd/os.walk."""
+    """Arquivos-texto candidatos (p/ resolver NOT). B1: consistente com a busca
+    positiva — o rg PULA binários nos conjuntos de termo, então o universo também
+    é só-texto. Senão um `NOT termo` despejava TODO binário (inclusive os que
+    CONTÊM o termo, que o `rg -l` não lista → falso positivo)."""
     if engine.RG:
-        cmd = _rg_base(q) + ["--files", "--"] + q.paths
+        # -l -e "" lista todo arquivo que o rg trata como TEXTO (binário fora).
+        # matching=False remove --word-regexp (quebraria o padrão vazio).
+        cmd = _rg_base(q, matching=False) + ["-l", "-e", "", "--"] + q.paths
         errf = tempfile.TemporaryFile(mode="w+")  # N2: captura stderr
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -259,7 +278,8 @@ def _universe(q: engine.Query, cancel, stats=None) -> set[str]:
                 _reap_stats(proc, errf, stats)    # B1 + N2
             return out
     local = {} if stats is not None else None
-    res = {os.path.abspath(m.path) for m in engine._iter_names_python(q, local)}
+    res = {os.path.abspath(m.path) for m in engine._iter_names_python(q, local, cancel)
+           if _is_probably_text(m.path)}          # B1: paridade — universo só-texto
     _merge_denied(stats, local)
     return res
 

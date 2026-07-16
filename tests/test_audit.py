@@ -707,6 +707,48 @@ def test_max_depth_backend_parity():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_boolean_not_excludes_binaries():
+    """B1: `NOT termo` não pode despejar binários — o universo do NOT era
+    `rg --files` (tudo) enquanto os termos são `rg -l` (pula binário), então um
+    binário que CONTÉM o termo aparecia no NOT (falso positivo) e todo binário
+    poluía o resultado. Universo agora é só-texto (mesmo domínio da busca)."""
+    d = tempfile.mkdtemp(prefix="lfs_b1_")
+    try:
+        def mk(name, data):
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(data)
+        mk("texto_com_foo.txt", b"isto tem foo aqui\n")
+        mk("texto_sem_foo.txt", b"nada aqui\noutra linha\n")
+        mk("bin_com_foo.bin",   b"foo\x00\x01\x02 binario que contem foo")
+        mk("bin_sem_foo.bin",   b"\x00\x01\x02 binario sem o termo")
+
+        def run_not(use_rg):
+            srg, sfd = engine.RG, engine.FD
+            if not use_rg:
+                engine.RG = None; engine.FD = None
+            try:
+                got = []
+                boolean.search_boolean(Query(paths=[d]), "NOT foo",
+                                       lambda m: got.append(os.path.basename(m.path)),
+                                       lambda: False)
+                return sorted(got)
+            finally:
+                engine.RG, engine.FD = srg, sfd
+
+        for use_rg in ((True, False) if engine.RG else (False,)):
+            tag = "rg" if use_rg else "python"
+            res = run_not(use_rg)
+            assert res == ["texto_sem_foo.txt"], (tag, res)   # sem NENHUM binário
+        # sanidade: positivo 'foo' não regride (binário fora)
+        got = []
+        boolean.search_boolean(Query(paths=[d]), "foo",
+                               lambda m: got.append(os.path.basename(m.path)), lambda: False)
+        assert sorted(got) == ["texto_com_foo.txt"], got
+        print("ok  B1  NOT não despeja binários (universo só-texto; rg e python)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_boolean_deep_nesting():
     """B2: aninhamento absurdo de parênteses vira BooleanError, não RecursionError."""
     try:
@@ -736,7 +778,8 @@ def main():
            test_i18n_mechanism, test_i18n_no_stale_keys,
            test_name_search_includes_dirs,
            test_name_newline_in_filename, test_name_broken_symlink,
-           test_max_depth_backend_parity, test_boolean_deep_nesting]
+           test_max_depth_backend_parity, test_boolean_deep_nesting,
+           test_boolean_not_excludes_binaries]
     fail = 0
     for fn in fns:
         try:
