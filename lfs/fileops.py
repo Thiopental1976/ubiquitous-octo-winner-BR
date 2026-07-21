@@ -28,7 +28,8 @@ of that up front, because failing on file 380 of 400 (or at byte 4294967296 of
 an 8 GiB video) is not an acceptable way to learn the destination was FAT32.
 """
 from __future__ import annotations
-import errno, os, shutil, stat, time
+import errno, os, shutil, stat, subprocess, time
+from urllib.parse import quote
 
 try:                        # pacote (GUI) e flat (cli.py/testes)
     from . import disks
@@ -426,6 +427,113 @@ def _apply_meta(src, dst, caps):
             pass
 
 
+def _part_path(dst: str, caps) -> str:
+    """dst + '.sombrero-part'. Encurta o RADICAL do nome se o temporário estourar o
+    limite de bytes/caracteres do destino (ele tem que caber tanto quanto o arquivo
+    final). Órfão inequívoco se cair a energia no meio da promoção."""
+    d, base = os.path.split(dst)
+    nmax = getattr(caps, "namemax", 255) or 255
+    cmax = getattr(caps, "maxchars", None)
+
+    def cabe(nome):
+        if len(os.fsencode(nome)) > nmax:
+            return False
+        return not (cmax and len(nome) > cmax)
+
+    nome = base + PART_SUFFIX
+    while base and not cabe(nome):
+        base = base[:-1]
+        nome = base + PART_SUFFIX
+    return os.path.join(d, nome or ("x" + PART_SUFFIX))
+
+
+def _mtp_uri(dst_path: str, caps) -> str:
+    """Caminho FUSE do gvfs -> URI que o `gio` entende:
+    '/run/user/1000/gvfs/mtp:host=HOST/Storage/f.mp4' -> 'mtp://HOST/Storage/f.mp4'.
+    O host já vem percent-encoded no nome do diretório gvfs; os componentes do
+    caminho (nomes reais) são encodados por BYTE, como o path_to_uri da GUI —
+    preserva nome não-UTF-8 sem descartar byte."""
+    mp = getattr(caps, "mountpoint", "") or "/run/user/%d/gvfs" % os.getuid()
+    parts = [p for p in os.path.relpath(os.path.abspath(dst_path), mp).split(os.sep)
+             if p and p != "."]
+    comp = parts[0] if parts else ""                 # 'mtp:host=HOST'
+    scheme, _, spec = comp.partition(":")
+    host = spec.split("host=", 1)[-1] if "host=" in spec else spec
+    rest = "/".join(quote(os.fsencode(p), safe="") for p in parts[1:])
+    return f"{scheme}://{host}/{rest}"
+
+
+def _run_gio(argv, cancel):
+    """Roda um `gio` cancelável. Devolve (returncode, stderr); returncode None =
+    cancelado (subprocesso terminado). Isolado para os testes injetarem um fake."""
+    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    while True:
+        try:
+            proc.wait(timeout=0.1)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                return (None, "cancelado")
+    err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+    return (proc.returncode, err)
+
+
+def _gio_copy(src, dst, caps, cancel, tick, prog, overwrite, _runner=None):
+    """Estratégia GIO (§3.3): grava no gvfs-MTP por DENTRO (a mesma rota do Nemo),
+    porque a ponte FUSE recusa open('wb'). Transferência por arquivo INTEIRO
+    (semântica nativa do MTP); progresso com granularidade de arquivo. Cancelar
+    termina o subprocesso e aborta o objeto parcial."""
+    runner = _runner or _run_gio
+    uri = _mtp_uri(dst, caps)
+    if overwrite:                        # gio copy não sobrescreve sem flag: remove antes
+        runner(["gio", "remove", "--", uri], None)
+    rc, err = runner(["gio", "copy", "--", src, uri], cancel)
+    if rc is None:                       # cancelado: aborta o parcial no aparelho
+        runner(["gio", "remove", "--", uri], None)
+        return None
+    if rc != 0:
+        raise OSError(errno.EIO, f"gio copy falhou ({rc}): {(err or '').strip()[:200]}")
+    try:
+        size = os.stat(src).st_size
+    except OSError:
+        size = 0
+    prog.done_bytes += size              # granularidade por arquivo (bytes indisponíveis)
+    tick()
+    return size
+
+
+def _write_file(src, dst, strategy, caps, cancel, tick, prog, pace, overwrite,
+                _gio_runner=None):
+    """Escreve UM arquivo pela estratégia decidida no preflight. Devolve bytes
+    copiados, ou None se cancelado (destino parcial já removido). NUNCA toca a
+    origem — o temporário e a promoção são todos no DESTINO."""
+    if strategy == STRAT_GIO:
+        return _gio_copy(src, dst, caps, cancel, tick, prog, overwrite, _gio_runner)
+    # ATOMIC / GUARDED: fluxo em bloco para um temporário + promoção sobre o alvo.
+    # O original do destino só some quando o novo está íntegro e no disco (fsync).
+    part = _part_path(dst, caps)
+    n = _copy_stream(src, part, cancel, tick, prog, pace)
+    if n is None:
+        return None                      # cancelado: _copy_stream já removeu o part
+    try:
+        if strategy == STRAT_GUARDED:    # jmtpfs: sem os.replace atômico
+            if os.path.lexists(dst):
+                os.unlink(dst)           # só DEPOIS do part pronto (janela mínima)
+            os.rename(part, dst)         # rename simples, sem alvo (libmtp aceita)
+        else:                            # ATOMIC
+            os.replace(part, dst)        # troca atômica sobre o alvo
+    except OSError as ex:
+        # o conteúdo novo está íntegro no part; NÃO apagar — reportar os dois nomes
+        raise OSError(ex.errno, f"{ex.strerror or ex}; conteúdo novo íntegro em "
+                                f"{os.path.basename(part)}")
+    return n
+
+
 def copy_to(sources, dest_dir, on_progress=None, on_conflict=None, cancel=None,
             sanitize_names=False, plan: Preflight | None = None) -> CopyResult:
     """Copia `sources` para `dest_dir`. A ORIGEM É ABERTA SÓ PARA LEITURA.
@@ -483,6 +591,7 @@ def copy_to(sources, dest_dir, on_progress=None, on_conflict=None, cancel=None,
 
     too_big = {p for p, _ in pf.too_big}
     bad = {p for p, _ in pf.bad_names}
+    strategy = pf.strategy or STRAT_ATOMIC     # decidida no preflight (§3.5)
 
     for e in pf.entries:
         if cancel is not None and cancel.is_set():
@@ -511,6 +620,7 @@ def copy_to(sources, dest_dir, on_progress=None, on_conflict=None, cancel=None,
             continue
 
         # conflito: só sobrescreve por escolha EXPLÍCITA do usuário
+        overwrite = False
         if os.path.lexists(dst):
             ans = resolve_conflict(e.src, dst)
             if ans == "cancel":
@@ -522,7 +632,8 @@ def copy_to(sources, dest_dir, on_progress=None, on_conflict=None, cancel=None,
                 continue
             if ans == "rename":
                 dst = _unique(dst)
-            # "overwrite": segue; o open("wb") trunca o DESTINO (nunca a origem)
+            elif ans == "overwrite":
+                overwrite = True          # a estratégia promove o novo por cima do velho
 
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -532,25 +643,19 @@ def copy_to(sources, dest_dir, on_progress=None, on_conflict=None, cancel=None,
 
         prog.current_path = e.src
         try:
-            if e.kind == "link":
-                if caps.symlinks:
-                    target = os.readlink(e.src)
-                    if os.path.lexists(dst):
-                        _rm_partial(dst)          # só o destino, decidido acima
-                    os.symlink(target, dst)
-                elif os.path.exists(e.src):
-                    # destino sem symlink (exFAT/FAT/NTFS/MTP): copia o CONTEÚDO
-                    n = _copy_stream(e.src, dst, cancel, tick, prog, pace)
-                    if n is None:
-                        res.cancelled = True
-                        break
-                    res.bytes_copied += n
-                    _apply_meta(e.src, dst, caps)
-                else:
-                    res.skipped.append((e.src, SKIP_SYMLINK))
-                    continue
+            if e.kind == "link" and caps.symlinks:
+                target = os.readlink(e.src)
+                if os.path.lexists(dst):
+                    _rm_partial(dst)              # só o destino, decidido acima
+                os.symlink(target, dst)
+            elif e.kind == "link" and not os.path.exists(e.src):
+                res.skipped.append((e.src, SKIP_SYMLINK))
+                continue
             else:
-                n = _copy_stream(e.src, dst, cancel, tick, prog, pace)
+                # arquivo, ou symlink degradado (destino sem symlink): copia CONTEÚDO
+                # pela estratégia decidida (ATOMIC/GUARDED/GIO), nunca in-place.
+                n = _write_file(e.src, dst, strategy, caps, cancel, tick, prog, pace,
+                                overwrite)
                 if n is None:
                     res.cancelled = True
                     break

@@ -1713,6 +1713,119 @@ def test_decide_strategy_machine():
     print("ok  A2R  máquina de estratégia: ATOMIC/GUARDED/GIO/BLOCKED decididos no preflight")
 
 
+def test_part_path_respects_name_limits():
+    """A2R §3.1: o temporário .sombrero-part tem que caber tanto quanto o arquivo
+    final — num FAT com nome de 250 chars, dst+sufixo estouraria os 255; encurta
+    o radical até caber, sem perder o sufixo (órfão inequívoco)."""
+    fat = disks.DestCaps(fstype="vfat", namemax=255, **disks._FAT)
+    p = fileops._part_path("/dst/" + "a" * 250 + ".mp4", fat)
+    base = os.path.basename(p)
+    assert base.endswith(fileops.PART_SUFFIX), "perdeu o sufixo .sombrero-part"
+    assert len(os.fsencode(base)) <= 255 and len(base) <= 255, "temp estourou o limite"
+    assert os.path.basename(fileops._part_path("/dst/v.bin", fat)) == \
+        "v.bin" + fileops.PART_SUFFIX, "nome curto não deveria ser encurtado"
+    print("ok  A2R  .sombrero-part cabe no limite do destino (encurta o radical se preciso)")
+
+
+def test_gio_strategy_uri_and_runner():
+    """A2R §3.3: a estratégia GIO grava no gvfs-MTP pela rota do Nemo (`gio copy`).
+    Testável sem hardware com o runner injetado: URI mtp:// correta (nome com
+    espaço percent-encoded), overwrite remove o antigo antes, falha vira erro claro
+    (não Errno 95 cru), e cancelar aborta o objeto parcial no aparelho."""
+    caps = disks.DestCaps(fstype="fuse.gvfsd-fuse", mountpoint="/run/user/1000/gvfs",
+                          via_gvfs=True, **disks._MTP)
+    dst = "/run/user/1000/gvfs/mtp:host=Philips_PMC7230/Storage/cena teste.mp4"
+    uri = fileops._mtp_uri(dst, caps)
+    assert uri == "mtp://Philips_PMC7230/Storage/cena%20teste.mp4", uri
+    d = tempfile.mkdtemp(prefix="lfs_gio_")
+    try:
+        src = os.path.join(d, "cena teste.mp4")
+        with open(src, "wb") as f:
+            f.write(b"z" * 2048)
+        chamadas = []
+        prog = fileops.CopyProgress()
+        n = fileops._gio_copy(src, dst, caps, None, lambda *a: None, prog,
+                              overwrite=True,
+                              _runner=lambda argv, c: (chamadas.append(argv) or (0, "")))
+        assert n == 2048 and prog.done_bytes == 2048, "progresso por arquivo não avançou"
+        assert chamadas[0][:2] == ["gio", "remove"], "overwrite não removeu o antigo antes"
+        assert chamadas[1] == ["gio", "copy", "--", src, uri], "comando gio copy errado"
+        # falha do gio vira OSError legível
+        try:
+            fileops._gio_copy(src, dst, caps, None, lambda *a: None,
+                              fileops.CopyProgress(), False,
+                              _runner=lambda argv, c: (1, "erro X"))
+            assert False, "gio copy com rc!=0 deveria levantar"
+        except OSError as ex:
+            assert "gio copy falhou" in str(ex), str(ex)
+        # cancelamento: rc None no copy -> devolve None e emite um remove (aborta parcial)
+        aborts = []
+
+        def cancel_runner(argv, c):
+            if argv[1] == "copy":
+                return (None, "cancelado")
+            aborts.append(argv)
+            return (0, "")
+        r = fileops._gio_copy(src, dst, caps, None, lambda *a: None,
+                              fileops.CopyProgress(), False, _runner=cancel_runner)
+        assert r is None and aborts and aborts[0][1] == "remove", \
+            "cancelamento deveria abortar o objeto parcial"
+        print("ok  A2R  GIO: URI mtp:// correta, overwrite remove antes, cancela abortando parcial")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_write_strategies_atomic_and_guarded():
+    """A2R §3.1/§3.2: ATOMIC e GUARDED promovem um temporário POR CIMA do alvo — o
+    arquivo antigo do destino só some quando o novo está íntegro. Cancelar no meio
+    de uma SOBRESCRITA preserva o antigo (nunca um único meio-arquivo como única
+    cópia), e não deixa .sombrero-part órfão no caminho feliz."""
+    d = tempfile.mkdtemp(prefix="lfs_strat_")
+    old_block = fileops.BLOCK
+    fileops.BLOCK = 4096
+    try:
+        src = os.path.join(d, "src"); os.mkdir(src)
+        dstdir = os.path.join(d, "dst"); os.mkdir(dstdir)
+        novo = b"N" * (4096 * 10)
+        with open(os.path.join(src, "v.bin"), "wb") as f:
+            f.write(novo)
+        with open(os.path.join(dstdir, "v.bin"), "wb") as f:
+            f.write(b"VELHO")
+        # ATOMIC overwrite: conteúdo novo, sem temporário órfão
+        fileops.copy_to([os.path.join(src, "v.bin")], dstdir,
+                        on_conflict=lambda s, dd: "overwrite")
+        assert open(os.path.join(dstdir, "v.bin"), "rb").read() == novo
+        assert not [f for f in os.listdir(dstdir) if f.endswith(fileops.PART_SUFFIX)], \
+            "sobrou .sombrero-part após a promoção"
+        # cancelar no meio da SOBRESCRITA: o VELHO2 tem que sobreviver
+        with open(os.path.join(dstdir, "v.bin"), "wb") as f:
+            f.write(b"VELHO2")
+        r = fileops.copy_to([os.path.join(src, "v.bin")], dstdir,
+                            on_conflict=lambda s, dd: "overwrite",
+                            cancel=_CancelAfter(2))
+        assert r.cancelled, "não marcou cancelado"
+        assert open(os.path.join(dstdir, "v.bin"), "rb").read() == b"VELHO2", \
+            "cancelamento no meio da sobrescrita destruiu o arquivo antigo (ATOMIC furou)"
+        assert not [f for f in os.listdir(dstdir) if f.endswith(fileops.PART_SUFFIX)], \
+            "cancelamento deixou .sombrero-part"
+        # GUARDED (jmtpfs): mesmo resultado observável por outra sequência
+        caps_guard = disks.DestCaps(fstype="fuse.jmtpfs", mountpoint=dstdir,
+                                    namemax=255, **disks._MTP)
+        prog = fileops.CopyProgress()
+        n = fileops._write_file(os.path.join(src, "v.bin"),
+                                os.path.join(dstdir, "v.bin"),
+                                fileops.STRAT_GUARDED, caps_guard, None,
+                                lambda *a: None, prog, 0, overwrite=True)
+        assert n == 4096 * 10
+        assert open(os.path.join(dstdir, "v.bin"), "rb").read() == novo
+        assert not [f for f in os.listdir(dstdir) if f.endswith(fileops.PART_SUFFIX)], \
+            "GUARDED deixou .sombrero-part"
+        print("ok  A2R  ATOMIC/GUARDED: promoção por cima do alvo; cancelar preserva o antigo")
+    finally:
+        fileops.BLOCK = old_block
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     fns = [test_parse_size, test_reap_kills_process, test_no_orphan_on_cancel,
            test_glob_case_insensitive, test_boolean_name_regex,
@@ -1738,6 +1851,8 @@ def main():
            test_dest_caps_restrictive_filesystems,
            test_mount_entry_sees_mtp_gvfs,
            test_write_probe_classifies_errno, test_decide_strategy_machine,
+           test_part_path_respects_name_limits, test_gio_strategy_uri_and_runner,
+           test_write_strategies_atomic_and_guarded,
            test_dest_caps_statvfs_lies_on_vfat,
            test_dest_caps_rejects_non_utf8_names,
            test_cli_emits_bytes_for_hostile_names,
