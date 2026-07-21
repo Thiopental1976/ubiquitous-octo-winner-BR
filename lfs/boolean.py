@@ -22,9 +22,11 @@ from typing import Optional
 
 try:                       # funciona como pacote (-m lfs.boolean / GUI) e flat (cli.py)
     from . import engine    # RG, Query, Match, _passes_meta, _iter_content_python
+    from . import disks     # topologia de disco (F7: extraída daqui)
     from .i18n import t
 except ImportError:
     import engine
+    import disks
     from i18n import t
 
 
@@ -295,53 +297,25 @@ _cache_lock = threading.Lock()               # protege cache/universo entre thre
 _WORKERS = int(os.environ.get("LFS_WORKERS", "3") or "3")   # afinável por env
 # Pontos de montagem onde discos SMR/USB do acervo costumam viver: seek concorrente
 # os castiga, então buscas AQUI são SERIALIZADAS (1 processo por vez).
-_MNT_PREFIXES = ("/mnt", "/media", "/run/media")
-
-
-def _under_mount(ap: str) -> bool:
-    return any(ap == pre or ap.startswith(pre + os.sep) for pre in _MNT_PREFIXES)
-
-
-def _dev_for_path(ap: str) -> str:
-    """Nó de dispositivo (/dev/...) que sustenta `ap`, pelo mount de prefixo mais
-    longo em /proc/mounts. "" se não achar (então tratamos como desconhecido)."""
-    best_mp, best_dev = "", ""
-    try:
-        with open("/proc/mounts", encoding="utf-8") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 2 or not parts[0].startswith("/dev/"):
-                    continue
-                dev = parts[0]
-                mp = parts[1].replace("\\040", " ")   # espaço é escapado no mounts
-                if ap == mp or mp == "/" or ap.startswith(mp.rstrip("/") + "/"):
-                    if len(mp) >= len(best_mp):        # prefixo mais específico vence
-                        best_mp, best_dev = mp, dev
-    except OSError:
-        return ""
-    return best_dev
-
-
-def _rotational(dev: str):
-    """'1'/'0' de /sys/block/<disco>/queue/rotational p/ o disco que sustenta o nó
-    `dev` (sobe da partição p/ o disco inteiro). None se desconhecido."""
-    if not dev:
-        return None
-    name = os.path.basename(dev)                       # sdb1, nvme0n1p1...
-    try:
-        real = os.path.realpath("/sys/class/block/" + name)
-        parent = os.path.basename(os.path.dirname(real))
-        base = name if parent == "block" else parent   # disco inteiro se for partição
-        with open("/sys/block/%s/queue/rotational" % base, encoding="ascii") as f:
-            return f.read().strip()
-    except OSError:
-        return None
+# F7: a topologia de disco mudou-se para disks.py (o motor de cópia precisa da
+# MESMA verdade sobre discos). Re-exportamos os nomes antigos — nada mais no
+# projeto precisa saber que a implementação saiu daqui.
+_MNT_PREFIXES = disks._MNT_PREFIXES
+_under_mount = disks._under_mount
+_dev_for_path = disks._dev_for_path
+_rotational = disks._rotational
 
 
 def _path_needs_serial(ap: str) -> bool:
     """Serializa se o caminho está sob /mnt (etc.) E o disco que o sustenta é
     rotacional ou desconhecido. SSD/NVMe confirmado (rotational=0) libera o
-    paralelismo mesmo sob /mnt — refinamento do parecer v3 (Fable 5)."""
+    paralelismo mesmo sob /mnt — refinamento do parecer v3 (Fable 5).
+
+    Fica AQUI (2 linhas, espelhando disks.path_needs_serial) de propósito: resolve
+    `_under_mount`/`_rotational`/`_dev_for_path` pelos globais DESTE módulo, então
+    o teste opt#2 — que troca boolean._dev_for_path/_rotational por mocks — segue
+    valendo. Delegar a disks.path_needs_serial ignoraria os mocks em silêncio: o
+    teste passaria lendo o sysfs REAL da máquina, que é o oposto de determinístico."""
     if not _under_mount(ap):
         return False
     return _rotational(_dev_for_path(ap)) != "0"       # None (desconhecido) => serializa

@@ -9,10 +9,12 @@ Recursos: nome+conteúdo, booleano (A OR B) AND C NOT D, documentos (PDF/docx/ep
 Desenho: GARIMPO_Desenho_Busca_ripgrep.md (Fable 5) — nome final "Linux File Search".
 """
 from __future__ import annotations
-import os, sys, time
+import os, sys, threading, time
+from urllib.parse import quote
 
 from PySide6.QtCore import (Qt, QThread, Signal, QAbstractTableModel, QModelIndex,
-                            QUrl, QTimer, QSortFilterProxyModel, QRect, QSize)
+                            QUrl, QTimer, QSortFilterProxyModel, QRect, QSize,
+                            QByteArray, QMimeData)
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QGuiApplication,
                            QIcon, QImageReader, QPixmap, QKeySequence, QShortcut,
                            QTextCharFormat, QTextCursor, QTextDocument)
@@ -21,7 +23,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QCheckBox, QLabel, QTableView, QPlainTextEdit,
     QFileDialog, QSplitter, QHeaderView, QSpinBox, QMenu, QTextEdit,
     QAbstractItemView, QToolButton, QFrame, QStackedWidget, QSlider, QSizePolicy,
-    QLayout)
+    QLayout, QDialog, QDialogButtonBox, QProgressBar, QFormLayout, QMessageBox,
+    QInputDialog)
 
 try:
     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -31,7 +34,7 @@ except ImportError:                     # QtMultimedia opcional (portabilidade)
     HAS_MEDIA = False
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import engine, boolean, i18n
+import engine, boolean, i18n, disks, fileops, xdg
 from engine import Query, Match
 from i18n import t
 
@@ -74,6 +77,56 @@ def human_size(n: int) -> str:
 
 
 parse_size = engine.parse_size          # §5: fonte única (era duplicado aqui e no cli)
+
+
+# ----------------------------------------------------------------- F7: interop
+def path_to_uri(path: str) -> str:
+    """Caminho -> URI file://, percent-encoded a partir dos BYTES do nome.
+
+    Não dá para usar QUrl.fromLocalFile aqui: ela recebe uma QString, e um nome
+    de arquivo não-UTF-8 (que no Linux é perfeitamente legal, e existe aos montes
+    num acervo vindo de Windows/câmera) chega em Python como surrogate escape —
+    a conversão para QString descarta esses bytes EM SILÊNCIO. A URI resultante
+    apontaria para um arquivo que não existe, e o gerenciador diria só "não
+    encontrado". fsencode + quote preserva byte a byte, que é como o
+    text/uri-list é definido."""
+    return "file://" + quote(os.fsencode(os.path.abspath(path)), safe="/")
+
+
+def build_paths_mime(paths) -> QMimeData:
+    """Carga de clipboard/arrasto que os gerenciadores de arquivo entendem.
+
+    Três formatos, porque cada família lê o seu — é o que faz Ctrl+C aqui e
+    Ctrl+V no Nemo funcionar de verdade:
+      text/uri-list                    todo mundo (percent-encoding cobre \\n,
+                                       espaço e nome não-UTF-8)
+      x-special/gnome-copied-files     Nemo/Nautilus/Caja — 'copy\\n' + URIs
+      application/x-kde-cutselection   Dolphin — '0' = é cópia, não recorte
+    O LFS nunca escreve 'cut' nem lê o clipboard: não existe Colar aqui."""
+    md = QMimeData()
+    urls = [QUrl.fromEncoded(QByteArray(path_to_uri(p).encode("ascii")))
+            for p in paths]
+    md.setUrls(urls)                                   # text/uri-list
+    md.setText("\n".join(paths))                       # soltar em terminal/editor
+    enc = "\n".join(path_to_uri(p) for p in paths)
+    md.setData("x-special/gnome-copied-files",
+               QByteArray(("copy\n" + enc).encode("ascii")))
+    md.setData("application/x-kde-cutselection", QByteArray(b"0"))
+    return md
+
+
+# D-Bus org.freedesktop.FileManager1: "abra a pasta COM o item selecionado".
+# Padrão freedesktop implementado por Nemo, Nautilus, Dolphin e Thunar.
+FM1_SERVICE = "org.freedesktop.FileManager1"
+FM1_PATH = "/org/freedesktop/FileManager1"
+FM1_IFACE = "org.freedesktop.FileManager1"
+
+
+def showitems_args(paths):
+    """Argumentos da chamada ShowItems. Função pura, separada da chamada, para o
+    teste headless verificar a montagem da mensagem sem barramento nenhum."""
+    uris = [path_to_uri(p) for p in paths]
+    return (FM1_SERVICE, FM1_PATH, FM1_IFACE, "ShowItems", uris, "")
 
 
 class FlowLayout(QLayout):
@@ -235,6 +288,31 @@ class ResultModel(QAbstractTableModel):
     def match_at(self, row):
         return self.rows[row] if 0 <= row < len(self.rows) else None
 
+    # ---- F7: arrastar para FORA (o gesto central: soltar no Nemo/desktop/e-mail)
+    def flags(self, idx):
+        f = super().flags(idx)
+        if idx.isValid():
+            f |= Qt.ItemIsDragEnabled
+        return f
+
+    def supportedDragActions(self):
+        """SÓ copiar. Nem MoveAction: mesmo que o alvo peça mover, o LFS não
+        oferece — o Nemo então copia. É a garantia não-destrutiva no nível do
+        protocolo de arrasto, não só do menu."""
+        return Qt.CopyAction
+
+    def supportedDropActions(self):
+        return Qt.CopyAction
+
+    def mimeTypes(self):
+        return ["text/uri-list", "text/plain"]
+
+    def mimeData(self, indexes):
+        # chegam 5 índices por linha (um por coluna): deduplica por linha
+        rows = sorted({i.row() for i in indexes if i.isValid()})
+        paths = [self.rows[r].path for r in rows if 0 <= r < len(self.rows)]
+        return build_paths_mime(paths)
+
 
 # ----------------------------------------------------------------- temas
 CONFIG_DIR = os.path.join(os.path.expanduser(
@@ -371,6 +449,339 @@ def _badge(name: str, present: bool, pal: dict) -> QLabel:
     return lab
 
 
+# ----------------------------------------------------------------- F7: fila de cópia
+class Ask:
+    """Uma pergunta feita PELA thread de cópia À GUI (conflito, pré-checagem).
+    A thread bloqueia até a resposta chegar; a GUI nunca espera pela thread —
+    então não existe caminho de travamento em círculo. O `wait` tem timeout para
+    que um cancelamento (ou o fechamento da janela) libere a thread na hora."""
+
+    def __init__(self):
+        self._ev = threading.Event()
+        self.value = None
+
+    def wait(self, timeout=0.2) -> bool:
+        return self._ev.wait(timeout)
+
+    def reply(self, value):
+        self.value = value
+        self._ev.set()
+
+
+class CopyQueue:
+    """FIFO de um worker só — decisão deliberada do desenho: a origem costuma ser
+    SMR, e paralelizar leitura é o seek thrash que este projeto existe para
+    evitar. Uma barra, um cancelar, raciocínio trivial (modelo Nemo)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs = []                     # [(sources, dest, sanitize)]
+        self.running = False
+
+
+class CopyWorker(QThread):
+    ask_preflight = Signal(object, object)      # (Preflight, Ask)
+    ask_conflict = Signal(str, str, object)     # (src, dst, Ask)
+    progress = Signal(object)                   # CopyProgress
+    job_started = Signal(str, int)              # destino, pendentes
+    job_done = Signal(object, str)              # (CopyResult|None, destino)
+    all_done = Signal()
+
+    def __init__(self, queue: CopyQueue):
+        super().__init__()
+        self.q = queue
+        self.cancel_ev = threading.Event()
+        self._stop = False
+
+    def cancel_all(self):
+        """Cancela o trabalho atual E esvazia a fila — é o que um botão
+        'Cancelar' significa para quem está olhando uma barra só."""
+        self._stop = True
+        self.cancel_ev.set()
+        with self.q.lock:
+            self.q.jobs.clear()
+
+    def _await(self, ask: Ask, on_cancel):
+        while not ask.wait(0.2):
+            if self._stop or self.cancel_ev.is_set():
+                return on_cancel
+        return ask.value if ask.value is not None else on_cancel
+
+    def _conflict(self, src, dst):
+        a = Ask()
+        self.ask_conflict.emit(src, dst, a)
+        return self._await(a, ("cancel", True))
+
+    def run(self):
+        while True:
+            with self.q.lock:
+                if self._stop or not self.q.jobs:
+                    self.q.running = False
+                    break
+                sources, dest, sanitize = self.q.jobs.pop(0)
+                pending = len(self.q.jobs)
+            self.job_started.emit(dest, pending)
+            try:
+                pf = fileops.preflight(sources, dest)
+            except Exception as e:                  # varredura nunca derruba a GUI
+                self.job_done.emit(None, f"{dest}\n{e}")
+                continue
+            a = Ask()
+            self.ask_preflight.emit(pf, a)          # a GUI decide seguir ou não
+            go = self._await(a, None)
+            if not go:
+                self.job_done.emit(None, dest)
+                continue
+            sanitize = bool(go.get("sanitize", sanitize))
+            res = fileops.copy_to(sources, dest,
+                                  on_progress=self.progress.emit,
+                                  on_conflict=self._conflict,
+                                  cancel=self.cancel_ev,
+                                  sanitize_names=sanitize, plan=pf)
+            self.job_done.emit(res, dest)
+        self.all_done.emit()
+
+
+class ConflictDialog(QDialog):
+    """Já existe um arquivo com esse nome no destino. NUNCA sobrescreve por
+    padrão: Pular é o botão default, Sobrescrever é escolha explícita."""
+
+    def __init__(self, parent, src, dst):
+        super().__init__(parent)
+        self.setWindowTitle(t("File already exists"))
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel(t("“{name}” already exists in the destination.",
+                             name=os.path.basename(dst))))
+        form = QFormLayout()
+        form.addRow(t("Source:"), QLabel(self._desc(src)))
+        form.addRow(t("Destination:"), QLabel(self._desc(dst)))
+        v.addLayout(form)
+        self.ck_all = QCheckBox(t("Apply to all conflicts in this copy"))
+        v.addWidget(self.ck_all)
+        bb = QDialogButtonBox()
+        b_skip = bb.addButton(t("Skip"), QDialogButtonBox.AcceptRole)
+        b_ren = bb.addButton(t("Keep both"), QDialogButtonBox.AcceptRole)
+        b_ovr = bb.addButton(t("Overwrite"), QDialogButtonBox.DestructiveRole)
+        bb.addButton(t("Cancel copy"), QDialogButtonBox.RejectRole)
+        b_skip.setDefault(True)
+        self.answer = "skip"
+        b_skip.clicked.connect(lambda: self._pick("skip"))
+        b_ren.clicked.connect(lambda: self._pick("rename"))
+        b_ovr.clicked.connect(lambda: self._pick("overwrite"))
+        bb.rejected.connect(lambda: self._pick("cancel"))
+        v.addWidget(bb)
+
+    @staticmethod
+    def _desc(p):
+        try:
+            st = os.stat(p)
+            return "%s · %s" % (human_size(st.st_size),
+                                time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)))
+        except OSError:
+            return "—"
+
+    def _pick(self, ans):
+        self.answer = ans
+        self.accept()
+
+
+class PreflightDialog(QDialog):
+    """O que a cópia vai fazer, ANTES de escrever um byte.
+
+    Esta tela é a razão de a checagem de destino existir: o destino típico é
+    pendrive/HD externo/aparelho de mídia, quase sempre exFAT/FAT32/NTFS/MTP.
+    Descobrir no arquivo 380 de 400 que o sistema de arquivos não aceita ':' no
+    nome — ou que trava em 4 GiB — não é uma forma aceitável de aprender isso."""
+
+    @staticmethod
+    def reason_text(why):
+        """Chave estável do fileops -> frase traduzida. Escrita como t() literal
+        (e não como tabela de strings) para o teste de i18n enxergar as chaves."""
+        return {
+            "charset": t("invalid characters for this filesystem"),
+            "length": t("name too long for this filesystem"),
+            "reserved": t("reserved name on this filesystem"),
+            "trailing": t("name ends in space or dot (dropped by this filesystem)"),
+        }.get(why, why)
+
+    def __init__(self, parent, pf):
+        super().__init__(parent)
+        self.setWindowTitle(t("Copy to…"))
+        self.resize(620, 420)
+        self.pf = pf
+        v = QVBoxLayout(self)
+        head = QLabel(t("{n} file(s), {size} → {dest}",
+                        n=pf.total_files, size=human_size(pf.total_bytes),
+                        dest=pf.dest_dir))
+        head.setWordWrap(True)
+        v.addWidget(head)
+        v.addWidget(QLabel(t("Destination filesystem: {fs} · {free} free",
+                             fs=pf.caps.label, free=human_size(pf.free_bytes))))
+
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        warn = []
+        if not pf.mount_ok:
+            warn.append(t("BLOCKED: the destination mount point is not mounted. "
+                          "Copying there would fill the system disk instead."))
+        if pf.caps.readonly:
+            warn.append(t("BLOCKED: the destination is mounted read-only."))
+        if not pf.fits:
+            warn.append(t("Not enough free space: needs {need}, has {free}.",
+                          need=human_size(pf.total_bytes), free=human_size(pf.free_bytes)))
+        if pf.too_big:
+            warn.append(t("{n} file(s) exceed the {fs} size limit and will be SKIPPED:",
+                          n=len(pf.too_big), fs=pf.caps.label))
+            warn += ["    %s  (%s)" % (os.path.basename(p), human_size(s))
+                     for p, s in pf.too_big[:20]]
+        if pf.bad_names:
+            warn.append(t("{n} name(s) are invalid on {fs}:", n=len(pf.bad_names),
+                          fs=pf.caps.label))
+            warn += ["    %s  — %s" % (os.path.basename(p), self.reason_text(why))
+                     for p, why in pf.bad_names[:20]]
+        if pf.links_degraded:
+            warn.append(t("{n} symlink(s) will be copied as real files "
+                          "({fs} has no symlinks).", n=len(pf.links_degraded),
+                          fs=pf.caps.label))
+        if pf.links_broken:
+            warn.append(t("{n} broken symlink(s) cannot be copied to {fs} and "
+                          "will be skipped.", n=len(pf.links_broken), fs=pf.caps.label))
+        for src, err in pf.errors[:10]:
+            warn.append("%s: %s" % (src, err))
+        self.details.setPlainText("\n".join(warn) if warn else
+                                  t("No problems found. Nothing in the source will be "
+                                    "modified — this only creates copies."))
+        v.addWidget(self.details, 1)
+
+        self.ck_fix = QCheckBox(t("Adapt invalid names (replace illegal characters)"))
+        self.ck_fix.setChecked(bool(pf.bad_names))
+        self.ck_fix.setEnabled(bool(pf.bad_names))
+        v.addWidget(self.ck_fix)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText(t("Copy"))
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        if pf.blocked:
+            bb.button(QDialogButtonBox.Ok).setEnabled(False)
+        v.addWidget(bb)
+
+
+class _DirSizeWorker(QThread):
+    """Soma o tamanho de uma pasta em thread, com contagem progressiva e cancel:
+    somar uma pasta do acervo num SMR pode levar minutos e não pode travar a GUI."""
+    tick = Signal(int, int)          # arquivos, bytes
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        files = total = 0
+        last = 0.0
+        for root, dirs, names in os.walk(self.path, onerror=lambda e: None):
+            if self._stop:
+                return
+            for n in names:
+                try:
+                    total += os.lstat(os.path.join(root, n)).st_size
+                    files += 1
+                except OSError:
+                    pass
+            now = time.time()
+            if now - last > 0.2:
+                last = now
+                self.tick.emit(files, total)
+        self.tick.emit(files, total)
+
+
+class PropertiesDialog(QDialog):
+    """Inspeção SOMENTE LEITURA. Não há campo editável aqui por decisão de
+    escopo: o LFS não altera o que encontrou."""
+
+    def __init__(self, parent, m):
+        super().__init__(parent)
+        self.setWindowTitle(t("Properties"))
+        self.resize(560, 360)
+        self.path = m.path
+        self._sizer = None
+        v = QVBoxLayout(self)
+        form = QFormLayout()
+        form.addRow(t("Name:"), self._sel(os.path.basename(m.path)))
+        form.addRow(t("Folder:"), self._sel(os.path.dirname(m.path)))
+        form.addRow(t("Type:"), self._sel(xdg.mime_for(m.path)))
+        self.lbl_size = self._sel("…")
+        form.addRow(t("Size:"), self.lbl_size)
+        try:
+            st = os.lstat(m.path)
+            form.addRow(t("Modified:"), self._sel(
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))))
+            form.addRow(t("Accessed:"), self._sel(
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_atime))))
+            form.addRow(t("Permissions:"), self._sel(oct(st.st_mode & 0o7777)[2:]))
+            form.addRow(t("Owner:"), self._sel("%d:%d" % (st.st_uid, st.st_gid)))
+            if os.path.islink(m.path):
+                form.addRow(t("Symlink to:"), self._sel(os.readlink(m.path)))
+            if os.path.isdir(m.path):
+                self._sizer = _DirSizeWorker(m.path)
+                self._sizer.tick.connect(self._on_size)
+                self._sizer.start()
+            else:
+                self.lbl_size.setText(human_size(st.st_size))
+        except OSError as e:
+            form.addRow(t("Error:"), self._sel(str(e)))
+        fs = disks.dest_caps(m.path)
+        form.addRow(t("Filesystem:"), self._sel("%s (%s)" % (fs.label, fs.fstype or "?")))
+        v.addLayout(form)
+
+        h = QHBoxLayout()
+        self.lbl_sum = QLabel("")
+        self.lbl_sum.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        btn = QPushButton(t("Compute checksum"))
+        btn.clicked.connect(self._checksum)      # nunca automático: lê o arquivo inteiro
+        h.addWidget(btn); h.addWidget(self.lbl_sum, 1)
+        v.addLayout(h)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        bb.accepted.connect(self.accept)
+        v.addWidget(bb)
+
+    @staticmethod
+    def _sel(txt):
+        lab = QLabel(txt)
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lab.setWordWrap(True)
+        return lab
+
+    def _on_size(self, files, total):
+        self.lbl_size.setText(t("{size}  ({n} file(s))", size=human_size(total), n=files))
+
+    def _checksum(self):
+        import hashlib
+        h = hashlib.blake2b()
+        try:
+            with open(self.path, "rb") as f:
+                while True:
+                    b = f.read(1 << 20)
+                    if not b:
+                        break
+                    h.update(b)
+            self.lbl_sum.setText("BLAKE2b " + h.hexdigest()[:32] + "…")
+        except OSError as e:
+            self.lbl_sum.setText(str(e))
+
+    def closeEvent(self, ev):
+        if self._sizer is not None and self._sizer.isRunning():
+            self._sizer.stop()
+            self._sizer.wait(2000)
+        super().closeEvent(ev)
+
+
 # ----------------------------------------------------------------- janela
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -390,6 +801,8 @@ class MainWindow(QMainWindow):
         self._tick.setInterval(500)
         self._tick.timeout.connect(self._heartbeat)
         self.cfg = load_cfg()
+        self.copy_q = CopyQueue()                 # F7: fila de cópia (um worker)
+        self.copier: CopyWorker | None = None
         self.muted = bool(self.cfg.get("muted", True))   # B13: mídia começa muda
         self.theme = self.cfg.get("theme", "dark")
         if self.theme not in THEMES:
@@ -399,6 +812,10 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_Escape), self, self.cancel_search)
         QShortcut(QKeySequence("Ctrl+L"), self, lambda: self.ed_name.setFocus())
         QShortcut(QKeySequence("Ctrl+T"), self, self.toggle_theme)
+        QShortcut(QKeySequence.Copy, self.table, self.copy_selection)      # F7
+        QShortcut(QKeySequence("Ctrl+Shift+C"), self.table, self.copy_paths)
+        QShortcut(QKeySequence("Alt+Return"), self.table, self.properties)
+        self.setAcceptDrops(True)                 # soltar pasta = "procure aqui"
         self.ed_name.setFocus()                   # digitar e Enter, sem clique
 
     # ---- UI
@@ -532,6 +949,11 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSortingEnabled(False)           # ligado só ao fim da busca
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # F7: arrastar resultados para FORA (Nemo, desktop, e-mail). DragOnly:
+        # a tabela não aceita drop — quem recebe pasta arrastada é a janela.
+        self.table.setDragEnabled(True)
+        self.table.setDragDropMode(QAbstractItemView.DragOnly)
+        self.table.setDefaultDropAction(Qt.CopyAction)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
@@ -553,6 +975,20 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(0, 3); split.setStretchFactor(1, 2)
         split.setSizes([470, 240])
         root.addWidget(split, 1)
+
+        # ---------- fila de cópia (visível só quando há operação) ----------
+        self.copy_bar = QFrame(); self.copy_bar.setObjectName("toolbar")
+        cb = QHBoxLayout(self.copy_bar); cb.setContentsMargins(12, 7, 12, 7); cb.setSpacing(9)
+        self.lbl_copy = QLabel(""); self.lbl_copy.setObjectName("section")
+        self.pb_copy = QProgressBar(); self.pb_copy.setTextVisible(False)
+        self.pb_copy.setFixedHeight(8)
+        self.lbl_copy_rate = QLabel(""); self.lbl_copy_rate.setObjectName("subtitle")
+        self.btn_copy_cancel = QPushButton(t("Cancel"))
+        self.btn_copy_cancel.clicked.connect(self.cancel_copy)
+        cb.addWidget(self.lbl_copy, 2); cb.addWidget(self.pb_copy, 3)
+        cb.addWidget(self.lbl_copy_rate); cb.addWidget(self.btn_copy_cancel)
+        self.copy_bar.setVisible(False)
+        root.addWidget(self.copy_bar)
 
         # ---------- status ----------
         self.status = QLabel(t("Ready."))
@@ -833,6 +1269,20 @@ class MainWindow(QMainWindow):
             if self.worker.isRunning():           # não saiu graciosamente: evita o
                 self.worker.terminate()           # abort do destrutor de QThread
                 self.worker.wait(2000)
+        # F7: mesma disciplina para a cópia. Uma cópia em curso NUNCA é abortada
+        # à força no meio de um arquivo sem antes pedir cancel — o fileops apaga
+        # o parcial do destino ao ser cancelado, e terminate() puro pularia isso,
+        # deixando meio-vídeo no pendrive com cara de arquivo bom.
+        if self.copier is not None and self.copier.isRunning():
+            self.copier.cancel_all()
+            deadline = time.time() + 8.0
+            while self.copier.isRunning() and time.time() < deadline:
+                if self.copier.wait(100):
+                    break
+                QApplication.processEvents()      # libera diálogos que a thread espera
+            if self.copier.isRunning():
+                self.copier.terminate()
+                self.copier.wait(2000)
         self._stop_media()
         super().closeEvent(ev)
 
@@ -1118,8 +1568,68 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(m.path))
 
     def open_folder(self):
-        for m in self._sel_matches()[:10]:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(m.path)))
+        """Abre a pasta COM O ITEM SELECIONADO, via org.freedesktop.FileManager1
+        (padrão que Nemo/Nautilus/Dolphin/Thunar implementam). Numa pasta do
+        acervo com centenas de vídeos, abrir sem destacar obriga o usuário a
+        reencontrar à mão o que o LFS acabou de achar."""
+        ms = self._sel_matches()[:10]
+        if not ms:
+            return
+        if self._show_items([m.path for m in ms]):
+            return
+        # fallback: sem serviço no barramento (WM exótico, distro sem gerenciador
+        # registrado) — abre a pasta simples, comportamento antigo
+        for d in dict.fromkeys(os.path.dirname(m.path) for m in ms):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+
+    def _show_items(self, paths) -> bool:
+        if getattr(self, "_fm1_ok", None) is False:
+            return False                       # já falhou antes: não tenta a cada clique
+        try:
+            from PySide6.QtDBus import QDBusConnection, QDBusInterface, QDBusMessage
+        except ImportError:
+            self._fm1_ok = False
+            return False
+        service, obj, iface, method, uris, startup = showitems_args(paths)
+        try:
+            bus = QDBusConnection.sessionBus()
+            if not bus.isConnected():
+                self._fm1_ok = False
+                return False
+            fm = QDBusInterface(service, obj, iface, bus)
+            if not fm.isValid():
+                self._fm1_ok = False
+                return False
+            reply = fm.call(method, uris, startup)
+            if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+                self._fm1_ok = False
+                return False
+        except Exception:
+            self._fm1_ok = False
+            return False
+        self._fm1_ok = True
+        return True
+
+    def open_with_menu(self, mnu: QMenu):
+        """Submenu "Abrir com": aplicativos que declaram saber abrir este tipo."""
+        mnu.clear()
+        ms = self._sel_matches()
+        if not ms:
+            return
+        paths = [m.path for m in ms[:10]]
+        for app in xdg.apps_for(paths[0]):
+            mnu.addAction(app.name, lambda _=False, a=app: xdg.launch(a, paths))
+        mnu.addSeparator()
+        mnu.addAction(t("Other command…"), self.open_with_other)
+
+    def open_with_other(self):
+        ms = self._sel_matches()
+        if not ms:
+            return
+        cmd, ok = QInputDialog.getText(self, t("Open with"),
+                                       t("Command (the file paths are appended):"))
+        if ok and cmd.strip():
+            xdg.launch_command(cmd.strip(), [m.path for m in ms[:10]])
 
     def copy_paths(self):
         ms = self._sel_matches()
@@ -1127,14 +1637,148 @@ class MainWindow(QMainWindow):
             QGuiApplication.clipboard().setText("\n".join(m.path for m in ms))
             self.status.setText(t("{n} path(s) copied.", n=len(ms)))
 
+    def copy_selection(self):
+        """Ctrl+C: coloca os ARQUIVOS no clipboard (não o texto do caminho), nos
+        três formatos que os gerenciadores leem — Ctrl+V no Nemo cola de verdade."""
+        ms = self._sel_matches()
+        if not ms:
+            return
+        QGuiApplication.clipboard().setMimeData(build_paths_mime([m.path for m in ms]))
+        self.status.setText(t("{n} item(s) copied to the clipboard.", n=len(ms)))
+
+    def properties(self):
+        ms = self._sel_matches()
+        if ms:
+            PropertiesDialog(self, ms[0]).exec()
+
+    # ---- F7: copiar para outro dispositivo
+    def _recent_dests(self):
+        return [d for d in self.cfg.get("copy_dests", []) if os.path.isdir(d)]
+
+    def copy_to_dialog(self, dest=None):
+        ms = self._sel_matches()
+        if not ms:
+            return
+        if not dest:
+            start = (self._recent_dests() or [os.path.expanduser("~")])[0]
+            dest = QFileDialog.getExistingDirectory(self, t("Copy to…"), start)
+        if not dest:
+            return
+        recents = [dest] + [d for d in self._recent_dests() if d != dest]
+        self.cfg["copy_dests"] = recents[:8]
+        save_cfg(self.cfg)
+        self.enqueue_copy([m.path for m in ms], dest)
+
+    def enqueue_copy(self, sources, dest):
+        with self.copy_q.lock:
+            self.copy_q.jobs.append((sources, dest, False))
+            pending = len(self.copy_q.jobs)
+            start = not self.copy_q.running
+            if start:
+                self.copy_q.running = True
+        if start:
+            self.copier = CopyWorker(self.copy_q)
+            self.copier.ask_preflight.connect(self.on_ask_preflight)
+            self.copier.ask_conflict.connect(self.on_ask_conflict)
+            self.copier.progress.connect(self.on_copy_progress)
+            self.copier.job_started.connect(self.on_copy_started)
+            self.copier.job_done.connect(self.on_copy_done)
+            self.copier.all_done.connect(self.on_copy_all_done)
+            self.copier.start()
+        else:
+            self.status.setText(t("Queued — {n} copy job(s) pending.", n=pending))
+
+    def on_ask_preflight(self, pf, ask):
+        dlg = PreflightDialog(self, pf)
+        ok = dlg.exec() == QDialog.Accepted
+        ask.reply({"sanitize": dlg.ck_fix.isChecked()} if ok else False)
+
+    def on_ask_conflict(self, src, dst, ask):
+        dlg = ConflictDialog(self, src, dst)
+        dlg.exec()
+        ask.reply((dlg.answer, dlg.ck_all.isChecked()))
+
+    def on_copy_started(self, dest, pending):
+        self.copy_bar.setVisible(True)
+        self.pb_copy.setRange(0, 0)                 # indeterminado durante a varredura
+        self.lbl_copy.setText(t("Scanning source…"))
+        self.lbl_copy_rate.setText(t("{n} pending", n=pending) if pending else "")
+
+    def on_copy_progress(self, p):
+        self.pb_copy.setRange(0, 1000)
+        frac = (p.done_bytes / p.total_bytes) if p.total_bytes else 0
+        self.pb_copy.setValue(int(frac * 1000))
+        self.lbl_copy.setText(t("Copying {name}", name=os.path.basename(p.current_path)))
+        self.lbl_copy_rate.setText("%s/s · %s / %s" % (
+            human_size(int(p.speed_bps)), human_size(p.done_bytes),
+            human_size(p.total_bytes)))
+
+    def on_copy_done(self, res, dest):
+        if res is None:
+            self.status.setText(t("Copy cancelled."))
+            return
+        parts = [t("{n} copied", n=len(res.copied))]
+        if res.skipped:
+            parts.append(t("{n} skipped", n=len(res.skipped)))
+        if res.failed:
+            parts.append(t("{n} failed", n=len(res.failed)))
+        self.status.setText(t("✔  Copy to {dest}: {summary}  ·  {size}  ·  "
+                              "nothing in the source was modified.",
+                              dest=dest, summary=", ".join(parts),
+                              size=human_size(res.bytes_copied)))
+        if res.failed:
+            QMessageBox.warning(self, t("Copy finished with errors"),
+                                "\n".join("%s: %s" % (os.path.basename(p), e)
+                                          for p, e in res.failed[:15]))
+
+    def on_copy_all_done(self):
+        self.copy_bar.setVisible(False)
+
+    def cancel_copy(self):
+        if getattr(self, "copier", None) and self.copier.isRunning():
+            self.copier.cancel_all()
+            self.status.setText(t("Cancelling copy…"))
+
+    # ---- F7: soltar pasta NA janela = "procure aqui" (não copia nada)
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+
+    def dropEvent(self, ev):
+        dirs = []
+        for u in ev.mimeData().urls():
+            p = u.toLocalFile()
+            if not p:
+                continue
+            dirs.append(p if os.path.isdir(p) else os.path.dirname(p))
+        cur = self._paths_list()
+        for d in dirs:
+            if d and d not in cur:
+                cur.append(d)
+        if dirs:
+            self.ed_path.setText(";".join(cur))
+            self.status.setText(t("Added {n} folder(s) to search in.", n=len(dirs)))
+            ev.acceptProposedAction()
+
     def context_menu(self, pos):
         if not self.table.selectionModel().hasSelection():
             return
         mnu = QMenu(self)
         mnu.addAction(t("Open file"), self.open_file)
-        mnu.addAction(t("Open folder"), self.open_folder)
+        sub = mnu.addMenu(t("Open with"))
+        sub.aboutToShow.connect(lambda m=sub: self.open_with_menu(m))
+        mnu.addAction(t("Open containing folder"), self.open_folder)
         mnu.addSeparator()
+        mnu.addAction(t("Copy"), self.copy_selection)
+        cp = mnu.addMenu(t("Copy to…"))
+        for d in self._recent_dests():
+            cp.addAction(d, lambda _=False, dd=d: self.copy_to_dialog(dd))
+        if self._recent_dests():
+            cp.addSeparator()
+        cp.addAction(t("Choose folder…"), lambda: self.copy_to_dialog())
         mnu.addAction(t("Copy path(s)"), self.copy_paths)
+        mnu.addSeparator()
+        mnu.addAction(t("Properties"), self.properties)
         mnu.exec(self.table.viewport().mapToGlobal(pos))
 
 

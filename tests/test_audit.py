@@ -826,6 +826,389 @@ def test_boolean_deep_nesting():
     print("ok  B2  parênteses fundíssimos -> BooleanError (sem RecursionError)")
 
 
+# ================================================================== F7: cópia
+# O teste mais importante desta fase é o de NÃO-DESTRUIÇÃO (test_copy_never_touches
+# _source): o LFS lê e exporta, jamais altera a origem. Os demais cobrem o que o
+# desenho listou + a pré-checagem do sistema de arquivos de DESTINO.
+import hashlib
+import fileops, disks
+
+
+def _snapshot(root):
+    """Impressão digital da árvore: caminho, tipo, modo, tamanho, mtime_ns e
+    conteúdo. Qualquer byte ou data que mude na origem quebra a comparação."""
+    snap = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in sorted(dirnames + filenames):
+            p = os.path.join(dirpath, name)
+            rel = os.path.relpath(p, root)
+            st = os.lstat(p)
+            if os.path.islink(p):
+                snap[rel] = ("link", os.readlink(p))
+            elif os.path.isdir(p):
+                snap[rel] = ("dir", oct(st.st_mode))
+            else:
+                with open(p, "rb") as f:
+                    snap[rel] = ("file", oct(st.st_mode), st.st_size, st.st_mtime_ns,
+                                 hashlib.blake2b(f.read()).hexdigest())
+    return snap
+
+
+def _hostile_tree():
+    """Árvore com os nomes que quebram implementação ingênua."""
+    d = tempfile.mkdtemp(prefix="lfs_cp_src_")
+    names = [
+        "simples.txt",
+        "com espaco.txt",
+        "com\nquebra.txt",                       # E1: \n no nome
+        os.fsdecode(b"nao\xff\xfeutf8.txt"),     # E2: nome não-UTF-8
+        "emoji_🎬.mp4",
+        "a" * (255 - len(".txt")) + ".txt",      # 255 BYTES, o limite do ext4
+    ]
+    for i, n in enumerate(names):
+        with open(os.path.join(d, n), "wb") as f:
+            f.write(b"conteudo %d\n" % i)
+        os.utime(os.path.join(d, n), (1000000 + i, 1000000 + i))
+    os.makedirs(os.path.join(d, "sub", "fundo"))
+    with open(os.path.join(d, "sub", "fundo", "profundo.txt"), "w") as f:
+        f.write("recursivo")
+    return d, names
+
+
+def test_copy_hostile_names():
+    """§6.1: nomes hostis chegam íntegros ao destino, com conteúdo e mtime."""
+    src, names = _hostile_tree()
+    dst = tempfile.mkdtemp(prefix="lfs_cp_dst_")
+    try:
+        res = fileops.copy_to([src], dst)
+        base = os.path.join(dst, os.path.basename(src))
+        assert not res.failed, res.failed
+        for n in names:
+            p = os.path.join(base, n)
+            assert os.path.exists(p), f"não copiou {n!r}"
+            assert os.stat(p).st_mtime == os.stat(os.path.join(src, n)).st_mtime, \
+                f"mtime perdido em {n!r}"
+        assert os.path.exists(os.path.join(base, "sub", "fundo", "profundo.txt")), \
+            "não copiou recursivamente"
+        assert res.bytes_copied > 0
+        print(f"ok  F7   nomes hostis copiados ({len(names)} nomes: \\n, não-UTF-8, "
+              "emoji, 255 bytes)")
+    finally:
+        shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
+
+
+def test_copy_symlinks_and_cycles():
+    """§6.2: symlink vira symlink; link quebrado é copiado como link; ciclo de
+    diretório não trava a varredura (guarda st_dev/st_ino)."""
+    src = tempfile.mkdtemp(prefix="lfs_cp_lnk_")
+    dst = tempfile.mkdtemp(prefix="lfs_cp_dst_")
+    try:
+        with open(os.path.join(src, "alvo.txt"), "w") as f:
+            f.write("alvo")
+        os.symlink("alvo.txt", os.path.join(src, "bom.lnk"))
+        os.symlink("nao_existe.txt", os.path.join(src, "quebrado.lnk"))
+        os.makedirs(os.path.join(src, "sub"))
+        os.symlink(src, os.path.join(src, "sub", "ciclo"))     # aponta p/ a raiz
+        res = fileops.copy_to([src], dst)             # não pode rodar para sempre
+        base = os.path.join(dst, os.path.basename(src))
+        assert os.path.islink(os.path.join(base, "bom.lnk")), "symlink virou arquivo"
+        assert os.readlink(os.path.join(base, "bom.lnk")) == "alvo.txt"
+        assert os.path.islink(os.path.join(base, "quebrado.lnk")), \
+            "link quebrado devia ser copiado como link"
+        assert os.path.islink(os.path.join(base, "sub", "ciclo")), "ciclo virou pasta"
+        assert not res.failed, res.failed
+        print("ok  F7   symlink preservado, link quebrado copiado, ciclo não trava")
+    finally:
+        shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
+
+
+def test_copy_conflicts():
+    """§6.3: skip / rename / overwrite fazem exatamente o esperado, e o
+    incremento 'nome (1).ext' pula os que já existem."""
+    src = tempfile.mkdtemp(prefix="lfs_cp_cf_")
+    dst = tempfile.mkdtemp(prefix="lfs_cp_dst_")
+    try:
+        with open(os.path.join(src, "x.txt"), "w") as f:
+            f.write("NOVO")
+        for ans, esperado in (("skip", "VELHO"), ("overwrite", "NOVO")):
+            with open(os.path.join(dst, "x.txt"), "w") as f:
+                f.write("VELHO")
+            fileops.copy_to([os.path.join(src, "x.txt")], dst,
+                            on_conflict=lambda s, d, a=ans: a)
+            assert open(os.path.join(dst, "x.txt")).read() == esperado, ans
+        # rename: já existem x.txt e x (1).txt -> tem que criar x (2).txt
+        open(os.path.join(dst, "x (1).txt"), "w").close()
+        fileops.copy_to([os.path.join(src, "x.txt")], dst,
+                        on_conflict=lambda s, d: "rename")
+        assert os.path.exists(os.path.join(dst, "x (2).txt")), \
+            "incremento não pulou o 'x (1).txt' existente"
+        # SEM callback o padrão é PULAR — nunca sobrescrever por omissão
+        with open(os.path.join(dst, "x.txt"), "w") as f:
+            f.write("INTOCADO")
+        r = fileops.copy_to([os.path.join(src, "x.txt")], dst)
+        assert open(os.path.join(dst, "x.txt")).read() == "INTOCADO", \
+            "sobrescreveu sem o usuário mandar"
+        assert r.skipped and r.skipped[0][1] == fileops.SKIP_CONFLICT
+        print("ok  F7   conflito: skip/rename/overwrite corretos; padrão = pular")
+    finally:
+        shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
+
+
+class _CancelAfter:
+    """Event falso que dispara na N-ésima consulta: cancelamento determinístico
+    NO MEIO de um arquivo, sem depender de temporização."""
+
+    def __init__(self, after):
+        self.n, self.after = 0, after
+
+    def is_set(self):
+        self.n += 1
+        return self.n > self.after
+
+
+def test_copy_cancel_removes_partial():
+    """§6.4: cancelar no meio de um arquivo apaga o PARCIAL do destino (nunca
+    deixar meio-vídeo no pendrive com cara de arquivo bom); os já concluídos
+    permanecem e o CopyResult diz o que houve."""
+    src = tempfile.mkdtemp(prefix="lfs_cp_cn_")
+    dst = tempfile.mkdtemp(prefix="lfs_cp_dst_")
+    old_block = fileops.BLOCK
+    fileops.BLOCK = 4096
+    try:
+        with open(os.path.join(src, "a_pequeno.bin"), "wb") as f:
+            f.write(b"x" * 4096)
+        with open(os.path.join(src, "b_grande.bin"), "wb") as f:
+            f.write(b"y" * (4096 * 50))
+        antes = _snapshot(src)
+        # 6 consultas: passa pelo diretório e pelo arquivo pequeno inteiro, e
+        # dispara DEPOIS do 1º bloco do grande — ou seja, com parcial no disco.
+        res = fileops.copy_to([src], dst, cancel=_CancelAfter(6))
+        base = os.path.join(dst, os.path.basename(src))
+        assert res.cancelled, "não marcou cancelado"
+        assert os.path.exists(os.path.join(base, "a_pequeno.bin")), \
+            "arquivo já concluído sumiu"
+        assert not os.path.exists(os.path.join(base, "b_grande.bin")), \
+            "deixou parcial no destino"
+        assert _snapshot(src) == antes, "ORIGEM MUDOU num cancelamento"
+        print("ok  F7   cancel no meio: parcial removido, concluídos ficam, origem intacta")
+    finally:
+        fileops.BLOCK = old_block
+        shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
+
+
+def test_copy_never_touches_source():
+    """§6.5 — O TESTE MAIS IMPORTANTE DA FASE. Depois de TODA operação possível
+    (cópia normal, conflito nos três modos, cancelamento, destino cheio, nome
+    ilegal), a árvore de origem é comparada byte a byte e mtime a mtime com um
+    snapshot prévio. Um único byte diferente reprova."""
+    src, _ = _hostile_tree()
+    os.symlink("simples.txt", os.path.join(src, "link.lnk"))
+    dst = tempfile.mkdtemp(prefix="lfs_cp_dst_")
+    try:
+        antes = _snapshot(src)
+        fileops.copy_to([src], dst)                                   # normal
+        for ans in ("skip", "rename", "overwrite"):                   # os 3 conflitos
+            fileops.copy_to([src], dst, on_conflict=lambda s, d, a=ans: a)
+        fileops.copy_to([src], dst, cancel=_CancelAfter(2))           # cancelado
+        fileops.copy_to([src], dst, sanitize_names=True)              # nomes adaptados
+        # destino "FAT32": limite de tamanho e charset restrito
+        old = disks.dest_caps
+        disks.dest_caps = lambda p: disks.DestCaps(fstype="vfat", namemax=255,
+                                                   **disks._FAT)
+        try:
+            fileops.copy_to([src], dst)
+            fileops.copy_to([src], dst, sanitize_names=True)
+        finally:
+            disks.dest_caps = old
+        depois = _snapshot(src)
+        assert depois == antes, (
+            "A ORIGEM MUDOU — invariante central do F7 violada:\n" +
+            "\n".join(f"  {k}: {antes.get(k)} -> {depois.get(k)}"
+                      for k in set(antes) | set(depois) if antes.get(k) != depois.get(k)))
+        print("ok  F7   PROVA DE NÃO-DESTRUIÇÃO: origem byte-idêntica após 8 operações")
+    finally:
+        shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
+
+
+def test_preflight_space_and_mount():
+    """§6.6/6.7: falta de espaço é detectada ANTES de escrever, e um destino sob
+    /mnt que não está montado bloqueia a cópia (copiar para um mountpoint vazio
+    despejaria o acervo no disco de sistema)."""
+    src, _ = _hostile_tree()
+    dst = tempfile.mkdtemp(prefix="lfs_cp_dst_")
+    try:
+        pf = fileops.preflight([src], dst)
+        assert pf.total_files >= 6 and pf.total_bytes > 0
+        assert pf.fits, "deveria caber no /tmp"
+        old_free = disks.free_bytes
+        disks.free_bytes = lambda p: 10                   # 10 bytes livres
+        try:
+            pf2 = fileops.preflight([src], dst)
+            assert not pf2.fits, "não detectou falta de espaço"
+        finally:
+            disks.free_bytes = old_free
+        # montagem ausente: /mnt/inexistente_xyz não está em user_mounts()
+        assert not disks.mount_ok("/mnt/inexistente_xyz_lfs/sub"), \
+            "mount_ok aprovou destino não montado"
+        assert disks.mount_ok(dst), "mount_ok reprovou /tmp (fora dos prefixos)"
+        pf3 = fileops.preflight([src], "/mnt/inexistente_xyz_lfs")
+        assert pf3.blocked, "preflight não bloqueou destino desmontado"
+        res = fileops.copy_to([src], "/mnt/inexistente_xyz_lfs", plan=pf3)
+        assert not res.copied, "escreveu apesar do bloqueio"
+        print("ok  F7   pré-checagem: falta de espaço e mountpoint ausente bloqueiam antes")
+    finally:
+        shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
+
+
+def test_dest_caps_restrictive_filesystems():
+    """O furo que o desenho não cobria: o destino de verdade é pendrive/HD
+    externo/aparelho de mídia — exFAT, FAT32, NTFS ou MTP. Nenhum deles tem
+    symlink nem permissão POSIX, FAT32 trava em 4 GiB e todos proíbem : ? * etc.
+    Descobrir isso no arquivo 380 de 400 não é aceitável: tem que ser ANTES."""
+    fat = disks.DestCaps(fstype="vfat", namemax=255, **disks._FAT)
+    assert fat.max_file == (1 << 32) - 1 and not fat.symlinks and not fat.perms
+    assert fat.name_problem("filme: cena?.mp4") == "charset"
+    assert fat.name_problem("linha\nquebrada.txt") == "charset"
+    assert fat.name_problem("CON.txt") == "reserved"
+    assert fat.name_problem("nome final .txt") is None      # ponto/espaço no MEIO, ok
+    assert fat.name_problem("termina em ponto.") == "trailing"
+    assert fat.name_problem("a" * 300) == "length"
+    assert fat.name_problem("normal.mp4") is None
+    exfat = disks.DestCaps(fstype="exfat", namemax=255, **disks._EXFAT)
+    assert exfat.max_file is None and not exfat.symlinks     # exFAT não tem 4 GiB
+    posix = disks.DestCaps(fstype="ext4", namemax=255)
+    assert posix.name_problem("filme: cena?.mp4") is None    # no ext4 é nome válido
+    assert not posix.restrictive and fat.restrictive
+    # sanitize: nome legal, extensão preservada, dentro do limite de BYTES
+    for nome in ("filme: cena?.mp4", "CON.txt", "termina em ponto.", "a" * 400 + ".mkv",
+                 os.fsdecode(b"n\xff\xfeao_utf8.mp4")):
+        s = fat.sanitize(nome)
+        assert fat.name_problem(s) is None, f"sanitize deixou nome ilegal: {s!r}"
+        assert len(os.fsencode(s)) <= 255
+    assert fat.sanitize("filme: cena?.mp4").endswith(".mp4"), "perdeu a extensão"
+    print("ok  F7   capacidades do destino: FAT/exFAT/NTFS pegos antes de copiar")
+
+
+def test_preflight_flags_fat_problems():
+    """Com destino FAT32, a pré-varredura tem que listar o que vai falhar
+    (tamanho e nome) e a cópia pular esses itens com motivo — nunca abortar no
+    meio nem escrever um arquivo truncado."""
+    src = tempfile.mkdtemp(prefix="lfs_fat_")
+    dst = tempfile.mkdtemp(prefix="lfs_cp_dst_")
+    old = disks.dest_caps
+    disks.dest_caps = lambda p: disks.DestCaps(fstype="vfat", namemax=255, **disks._FAT)
+    try:
+        with open(os.path.join(src, "ok.mp4"), "w") as f:
+            f.write("pequeno")
+        ilegal = os.path.join(src, "cena: 12?.mp4")
+        with open(ilegal, "w") as f:
+            f.write("nome ilegal em FAT")
+        os.symlink("ok.mp4", os.path.join(src, "atalho.lnk"))
+        grande = os.path.join(src, "gigante.mkv")
+        with open(grande, "wb") as f:                   # esparso: 5 GiB sem gastar disco
+            f.truncate(5 * (1 << 30))
+        pf = fileops.preflight([src], dst)
+        assert [p for p, _ in pf.too_big] == [grande], pf.too_big
+        assert [os.path.basename(p) for p, _ in pf.bad_names] == ["cena: 12?.mp4"]
+        assert pf.links_degraded, "symlink em FAT devia virar cópia real"
+        # sem adaptar: pula com motivo. Adaptando: copia com nome legal.
+        res = fileops.copy_to([src], dst, plan=pf)
+        motivos = dict((os.path.basename(p), r) for p, r in res.skipped)
+        assert motivos.get("gigante.mkv") == fileops.SKIP_TOO_BIG, motivos
+        assert motivos.get("cena: 12?.mp4") == fileops.SKIP_BAD_NAME, motivos
+        res2 = fileops.copy_to([src], dst, plan=pf, sanitize_names=True)
+        base = os.path.join(dst, os.path.basename(src))
+        assert os.path.exists(os.path.join(base, "cena_ 12_.mp4")), os.listdir(base)
+        assert not os.path.islink(os.path.join(base, "atalho.lnk")), \
+            "criou symlink num FS que não tem symlink"
+        assert res2.copied
+        print("ok  F7   destino FAT32: >4 GiB e nome ilegal pulados com motivo; "
+              "com 'adaptar', copia")
+    finally:
+        disks.dest_caps = old
+        shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
+
+
+def test_copy_into_itself():
+    """Copiar uma pasta para dentro dela mesma não pode virar recursão infinita."""
+    src = tempfile.mkdtemp(prefix="lfs_self_")
+    try:
+        os.makedirs(os.path.join(src, "dentro"))
+        with open(os.path.join(src, "a.txt"), "w") as f:
+            f.write("a")
+        pf = fileops.preflight([src], os.path.join(src, "dentro"))
+        assert any(r == fileops.SKIP_LOOP for _, r in pf.errors), pf.errors
+        assert not pf.entries, "planejou copiar a pasta para dentro de si mesma"
+        print("ok  F7   cópia da pasta para dentro dela mesma é recusada no plano")
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+
+
+def test_qt_drag_and_clipboard_payload():
+    """§6.8/6.9 (único teste com Qt, pulado sem display): o payload de arrasto e
+    de clipboard tem os três formatos, é sempre CÓPIA (jamais mover) e o URI
+    roundtripa nomes com \\n e não-UTF-8."""
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        print("--  F7   payload Qt: pulado (sem display)")
+        return
+    try:
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import Qt
+    except ImportError:
+        print("--  F7   payload Qt: pulado (sem PySide6)")
+        return
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lfs"))
+    import app as lfsapp
+    _ = QApplication.instance() or QApplication([])
+    hostis = ["/tmp/com espaco.txt", "/tmp/com\nquebra.txt",
+              os.fsdecode(b"/tmp/nao\xff\xfeutf8.txt")]
+    # A URI é montada dos BYTES do nome: é o que o Nemo recebe no fio. Passar
+    # pela QString (QUrl.fromLocalFile) comeria o \xff\xfe em silêncio e o
+    # arrasto apontaria para um arquivo inexistente.
+    assert lfsapp.path_to_uri("/tmp/com espaco.txt") == "file:///tmp/com%20espaco.txt"
+    assert lfsapp.path_to_uri("/tmp/com\nquebra.txt") == "file:///tmp/com%0Aquebra.txt"
+    assert lfsapp.path_to_uri(hostis[2]) == "file:///tmp/nao%FF%FEutf8.txt", \
+        lfsapp.path_to_uri(hostis[2])
+    md = lfsapp.build_paths_mime(hostis)
+    assert md.hasUrls()
+    fio = bytes(md.data("text/uri-list")).decode("ascii")
+    for p in hostis:
+        assert lfsapp.path_to_uri(p) in fio, f"URI ausente do uri-list: {p!r}"
+    gnome = bytes(md.data("x-special/gnome-copied-files")).decode("ascii")
+    assert gnome.startswith("copy\n"), gnome[:20]
+    assert gnome.count("\n") == len(hostis), "uma URI por linha após 'copy'"
+    assert "%0A" in gnome, "quebra de linha não foi percent-encoded"
+    assert bytes(md.data("application/x-kde-cutselection")) == b"0", "KDE: não é cópia"
+    m = lfsapp.ResultModel()
+    assert m.supportedDragActions() == Qt.CopyAction, \
+        "arrasto oferece MoveAction — o LFS jamais move"
+    svc, obj, iface, method, uris, _s = lfsapp.showitems_args(["/tmp/a b.txt"])
+    assert (svc, obj, iface, method) == ("org.freedesktop.FileManager1",
+                                         "/org/freedesktop/FileManager1",
+                                         "org.freedesktop.FileManager1", "ShowItems")
+    assert uris == ["file:///tmp/a%20b.txt"], uris
+    print("ok  F7   payload Qt: 3 formatos, só CopyAction, ShowItems bem montado")
+
+
+def test_fileops_has_no_destructive_api():
+    """Garantia estrutural: o motor de cópia não expõe NENHUMA função capaz de
+    apagar, mover ou renomear a origem. É a versão executável do princípio —
+    se alguém 'só adicionar um move()' um dia, este teste reprova."""
+    proibidos = ("move", "delete", "remove", "rename", "trash", "unlink", "rmtree",
+                 "chmod", "truncate")
+    achados = [n for n in dir(fileops)
+               if not n.startswith("_") and any(p in n.lower() for p in proibidos)]
+    assert not achados, f"fileops expõe API destrutiva: {achados}"
+    fonte = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "lfs", "fileops.py"), encoding="utf-8").read()
+    for chamada in ("shutil.move", "shutil.rmtree", "os.rename", "os.replace",
+                    "os.rmdir", "os.removedirs"):
+        assert chamada not in fonte, f"fileops chama {chamada}"
+    # os.unlink existe UMA vez só: apagar o parcial que nós mesmos criamos
+    assert fonte.count("os.unlink") == 1, "os.unlink em mais de um lugar no fileops"
+    print("ok  F7   fileops não tem API destrutiva (nem por dentro, nem exportada)")
+
+
 def main():
     fns = [test_parse_size, test_reap_kills_process, test_no_orphan_on_cancel,
            test_glob_case_insensitive, test_boolean_name_regex,
@@ -843,7 +1226,14 @@ def main():
            test_name_newline_in_filename, test_name_broken_symlink,
            test_max_depth_backend_parity, test_boolean_deep_nesting,
            test_boolean_not_excludes_binaries, test_boolean_escaped_quotes,
-           test_boolean_single_flight]
+           test_boolean_single_flight,
+           # F7 — gerenciador de arquivos (cópia não-destrutiva)
+           test_copy_hostile_names, test_copy_symlinks_and_cycles,
+           test_copy_conflicts, test_copy_cancel_removes_partial,
+           test_copy_never_touches_source, test_preflight_space_and_mount,
+           test_dest_caps_restrictive_filesystems, test_preflight_flags_fat_problems,
+           test_copy_into_itself, test_qt_drag_and_clipboard_payload,
+           test_fileops_has_no_destructive_api]
     fail = 0
     for fn in fns:
         try:

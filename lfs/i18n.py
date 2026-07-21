@@ -142,8 +142,97 @@ _PT = {
 
     # context menu
     "Open file": "Abrir arquivo",
-    "Open folder": "Abrir pasta",
     "Copy path(s)": "Copiar caminho(s)",
+    "Open with": "Abrir com",
+    "Other command…": "Outro comando…",
+    "Command (the file paths are appended):":
+        "Comando (os caminhos dos arquivos são anexados):",
+    "Open containing folder": "Abrir pasta do item",
+    "Copy": "Copiar",
+    "Copy to…": "Copiar para…",
+    "Choose folder…": "Escolher pasta…",
+    "Properties": "Propriedades",
+
+    # F7: copiar para outro dispositivo — pré-checagem do destino
+    "{n} file(s), {size} → {dest}": "{n} arquivo(s), {size} → {dest}",
+    "Destination filesystem: {fs} · {free} free":
+        "Sistema de arquivos do destino: {fs} · {free} livres",
+    "BLOCKED: the destination mount point is not mounted. "
+    "Copying there would fill the system disk instead.":
+        "BLOQUEADO: o ponto de montagem do destino não está montado. "
+        "Copiar para lá encheria o disco de sistema.",
+    "BLOCKED: the destination is mounted read-only.":
+        "BLOQUEADO: o destino está montado como somente leitura.",
+    "Not enough free space: needs {need}, has {free}.":
+        "Espaço livre insuficiente: precisa de {need}, tem {free}.",
+    "{n} file(s) exceed the {fs} size limit and will be SKIPPED:":
+        "{n} arquivo(s) excedem o limite de tamanho do {fs} e serão PULADOS:",
+    "{n} name(s) are invalid on {fs}:": "{n} nome(s) são inválidos em {fs}:",
+    "invalid characters for this filesystem":
+        "caracteres inválidos para este sistema de arquivos",
+    "name too long for this filesystem":
+        "nome longo demais para este sistema de arquivos",
+    "reserved name on this filesystem":
+        "nome reservado neste sistema de arquivos",
+    "name ends in space or dot (dropped by this filesystem)":
+        "nome termina em espaço ou ponto (descartado por este sistema de arquivos)",
+    "{n} symlink(s) will be copied as real files ({fs} has no symlinks).":
+        "{n} link(s) simbólico(s) virarão cópia real ({fs} não tem symlink).",
+    "{n} broken symlink(s) cannot be copied to {fs} and will be skipped.":
+        "{n} link(s) simbólico(s) quebrado(s) não cabem em {fs} e serão pulados.",
+    "No problems found. Nothing in the source will be modified — "
+    "this only creates copies.":
+        "Nenhum problema encontrado. Nada na origem será modificado — "
+        "isto apenas cria cópias.",
+    "Adapt invalid names (replace illegal characters)":
+        "Adaptar nomes inválidos (troca os caracteres ilegais)",
+
+    # F7: conflito no destino
+    "File already exists": "Arquivo já existe",
+    "“{name}” already exists in the destination.":
+        "“{name}” já existe no destino.",
+    "Source:": "Origem:",
+    "Destination:": "Destino:",
+    "Apply to all conflicts in this copy":
+        "Aplicar a todos os conflitos desta cópia",
+    "Skip": "Pular",
+    "Keep both": "Manter os dois",
+    "Overwrite": "Sobrescrever",
+    "Cancel copy": "Cancelar cópia",
+
+    # F7: fila e resultado da cópia
+    "Scanning source…": "Varrendo a origem…",
+    "Copying {name}": "Copiando {name}",
+    "{n} pending": "{n} na fila",
+    "Queued — {n} copy job(s) pending.": "Na fila — {n} cópia(s) pendente(s).",
+    "Cancelling copy…": "Cancelando cópia…",
+    "Copy cancelled.": "Cópia cancelada.",
+    "{n} copied": "{n} copiado(s)",
+    "{n} skipped": "{n} pulado(s)",
+    "{n} failed": "{n} com falha",
+    "✔  Copy to {dest}: {summary}  ·  {size}  ·  "
+    "nothing in the source was modified.":
+        "✔  Cópia para {dest}: {summary}  ·  {size}  ·  "
+        "nada na origem foi modificado.",
+    "Copy finished with errors": "Cópia terminou com erros",
+    "{n} item(s) copied to the clipboard.":
+        "{n} item(ns) copiado(s) para a área de transferência.",
+    "Added {n} folder(s) to search in.": "{n} pasta(s) adicionada(s) ao 'Em'.",
+
+    # F7: propriedades (somente leitura)
+    "Name:": "Nome:",
+    "Folder:": "Pasta:",
+    "Type:": "Tipo:",
+    "Size:": "Tamanho:",
+    "Modified:": "Modificado:",
+    "Accessed:": "Acessado:",
+    "Permissions:": "Permissões:",
+    "Owner:": "Dono:",
+    "Symlink to:": "Link para:",
+    "Filesystem:": "Sistema de arquivos:",
+    "Error:": "Erro:",
+    "Compute checksum": "Calcular checksum",
+    "{size}  ({n} file(s))": "{size}  ({n} arquivo(s))",
 
     # engine progress labels (boolean.py) — shown in the status line
     "term “{term}”": "termo “{term}”",
