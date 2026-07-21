@@ -206,6 +206,22 @@ install_app() {
   mkdir -p "$PREFIX/lfs" "$PREFIX/assets" "$BIN" "$APPDIR"
   cp -f "$SRC/lfs/"*.py "$PREFIX/lfs/"
   cp -f "$SRC/assets/"* "$PREFIX/assets/" 2>/dev/null || true
+  rm -rf "$PREFIX/lfs/__pycache__"     # .pyc velho de um módulo removido confunde
+
+  # Carimbo da build. O app instalado é uma CÓPIA: sem isto, nada na tela
+  # distingue a versão de hoje da de semana passada, e "isso não existe no
+  # programa" vira uma sessão inteira de depuração de um recurso que já estava
+  # pronto. O título da janela mostra o que este arquivo diz.
+  ver=""
+  if git -C "$SRC" rev-parse --short HEAD >/dev/null 2>&1; then
+    ver="$(git -C "$SRC" rev-parse --short HEAD)"
+    [ -n "$(git -C "$SRC" status --porcelain 2>/dev/null)" ] && ver="$ver+"
+    ver="$ver ($(git -C "$SRC" log -1 --format=%cs 2>/dev/null))"
+  else
+    ver="$(date +%Y-%m-%d)"            # tarball sem git: ao menos a data
+  fi
+  printf '%s\n' "$ver" > "$PREFIX/VERSION"
+  ok "build instalada: $ver"
 
   cat > "$BIN/$APP" <<EOF
 #!/usr/bin/env bash

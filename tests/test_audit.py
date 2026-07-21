@@ -1212,6 +1212,30 @@ def test_default_file_manager_wins_over_dbus():
     print("ok  F7   pasta abre no gerenciador padrão (D-Bus só se ele fizer ShowItems)")
 
 
+def test_build_info_visible_and_honest():
+    """O app INSTALADO é uma cópia dos fontes: commitar não muda o que o usuário
+    roda, e nada na tela dizia isso — um recurso já pronto foi reportado como
+    inexistente porque a cópia instalada era de 6 dias antes. Agora o título
+    mostra a build. Regra: mostrar a verdade ou não mostrar nada; número de
+    versão errado é pior que nenhum."""
+    import version
+    d = tempfile.mkdtemp(prefix="lfs_ver_")
+    try:
+        assert version.build_info(d) == "", "inventou build sem VERSION nem git"
+        assert version.title_suffix(d) == "", "sujou o título sem saber a build"
+        with open(os.path.join(d, "VERSION"), "w") as f:
+            f.write("6250d6c (2026-07-21)\nlinha ignorada\n")
+        assert version.build_info(d) == "6250d6c (2026-07-21)"
+        assert version.title_suffix(d) == "  ·  6250d6c (2026-07-21)"
+        # rodando do repo (sem VERSION), o git responde e marca o não-commitado
+        repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+        info = version.build_info(repo)
+        assert info, "no repo git a build tem que ser identificável"
+        print(f"ok  F7   build visível no título ({info})")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_fileops_has_no_destructive_api():
     """Garantia estrutural: o motor de cópia não expõe NENHUMA função capaz de
     apagar, mover ou renomear a origem. É a versão executável do princípio —
@@ -1255,7 +1279,7 @@ def main():
            test_copy_never_touches_source, test_preflight_space_and_mount,
            test_dest_caps_restrictive_filesystems, test_preflight_flags_fat_problems,
            test_copy_into_itself, test_qt_drag_and_clipboard_payload,
-           test_default_file_manager_wins_over_dbus,
+           test_default_file_manager_wins_over_dbus, test_build_info_visible_and_honest,
            test_fileops_has_no_destructive_api]
     fail = 0
     for fn in fns:

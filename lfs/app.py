@@ -34,7 +34,7 @@ except ImportError:                     # QtMultimedia opcional (portabilidade)
     HAS_MEDIA = False
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import engine, boolean, i18n, disks, fileops, xdg
+import engine, boolean, i18n, disks, fileops, xdg, version
 from engine import Query, Match
 from i18n import t
 
@@ -786,7 +786,9 @@ class PropertiesDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Linux File Search")
+        # O título carrega a BUILD: o app instalado é uma cópia dos fontes, então
+        # commitar não muda o que o usuário roda. Ver version.py.
+        self.setWindowTitle("Linux File Search" + version.title_suffix())
         # cabe SEMPRE na tela (monitor em retrato tem só ~1080 de largura útil);
         # janela maior que a tela perde o botão de maximizar no Muffin/Cinnamon
         scr = QGuiApplication.primaryScreen().availableGeometry()
