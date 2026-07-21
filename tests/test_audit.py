@@ -1227,11 +1227,18 @@ def test_build_info_visible_and_honest():
             f.write("6250d6c (2026-07-21)\nlinha ignorada\n")
         assert version.build_info(d) == "6250d6c (2026-07-21)"
         assert version.title_suffix(d) == "  ·  6250d6c (2026-07-21)"
-        # rodando do repo (sem VERSION), o git responde e marca o não-commitado
+        # marcador do git archive AINDA NÃO EXPANDIDO (é o que existe no
+        # worktree) não pode virar "versão": tem que cair no git de verdade
+        with open(os.path.join(d, "VERSION"), "w") as f:
+            f.write("$Format:%h (%cs)$\n")
+        assert version.build_info(d) == "", "mostrou o marcador cru como versão"
+        # no repo git a build é identificável; num .zip extraído sem git, o
+        # VERSION expandido pelo `git archive` responde. Uma das duas SEMPRE vale.
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
         info = version.build_info(repo)
-        assert info, "no repo git a build tem que ser identificável"
-        print(f"ok  F7   build visível no título ({info})")
+        tem_git = os.path.exists(os.path.join(repo, ".git"))
+        assert info or not tem_git, "no repo git a build tem que ser identificável"
+        print(f"ok  F7   build visível no título ({info or 'sem git e sem VERSION'})")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

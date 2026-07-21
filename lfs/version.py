@@ -28,12 +28,19 @@ _ROOT = os.path.dirname(_HERE)                 # …/linux_file_search ou …/<P
 
 
 def _from_file(root: str) -> str:
-    """VERSION escrito pelo install.sh: '<commit> <data>' na 1ª linha."""
+    """VERSION: '<commit> (<data>)' na 1ª linha.
+
+    Duas origens escrevem esse arquivo: o `install.sh` (carimba na instalação) e
+    o próprio `git archive`, que expande `$Format:%h (%cs)$` ao gerar o .zip —
+    assim quem recebe o pacote também vê de que commit ele saiu, sem precisar de
+    git. No WORKTREE o arquivo existe com o marcador ainda por expandir; nesse
+    caso ele não vale nada e caímos no git de verdade."""
     try:
         with open(os.path.join(root, "VERSION"), encoding="utf-8") as f:
-            return f.readline().strip()
+            line = f.readline().strip()
     except OSError:
         return ""
+    return "" if line.startswith("$Format") or not line else line
 
 
 def _git(root: str, *args) -> str:
