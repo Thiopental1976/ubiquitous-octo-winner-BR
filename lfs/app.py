@@ -1704,6 +1704,14 @@ class MainWindow(QMainWindow):
             if start:
                 self.copy_q.running = True
         if start:
+            # CORRIDA: o worker anterior marca `running = False` DENTRO do laço e
+            # só depois a QThread termina de fato. Um segundo arrasto que caia
+            # nessa fresta chegaria aqui com o objeto antigo ainda rodando, e
+            # reatribuir self.copier soltaria a última referência — destruir uma
+            # QThread viva aborta o processo (é o mesmo perigo que o closeEvent
+            # trata). Ele já saiu do laço, então isto retorna em microssegundos.
+            if self.copier is not None and self.copier.isRunning():
+                self.copier.wait(3000)
             self.copier = CopyWorker(self.copy_q)
             self.copier.ask_preflight.connect(self.on_ask_preflight)
             self.copier.ask_conflict.connect(self.on_ask_conflict)
