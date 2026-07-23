@@ -1375,6 +1375,42 @@ def test_cli_emits_bytes_for_hostile_names():
         shutil.rmtree(src, ignore_errors=True)
 
 
+def test_cli_json_and_exit_codes():
+    """F9b §3.1 (desenho Fable): a CLI `--json` é a interface de automação. NDJSON,
+    um objeto por match; nome com \\n é ESCAPADO pelo json e NUNCA racha o framing
+    de linha (o teste-chave do §5.6). Exit code estilo grep: 0=achou, 1=nada, 2=erro."""
+    import json as _json
+    src = tempfile.mkdtemp(prefix="lfs_json_")
+    try:
+        # nome hostil: contém \n — se o framing quebrar, vira 2 linhas e uma não é json
+        hostil = os.path.join(src, "linha1\nlinha2.txt")
+        open(hostil, "w").close()
+        open(os.path.join(src, "normal.txt"), "w").close()
+        run = lambda *a: subprocess.run([sys.executable, "-m", "lfs.cli", *a],
+                                        capture_output=True, cwd=RAIZ)
+        r = run("-n", "*.txt", "-l", "--json", src)
+        assert r.returncode == 0, f"achou → 0, veio {r.returncode}: {r.stderr.decode('utf-8','replace')}"
+        linhas = [ln for ln in r.stdout.decode("utf-8", "surrogatepass").splitlines() if ln.strip()]
+        objs = []
+        for ln in linhas:
+            objs.append(_json.loads(ln))          # cada linha DEVE ser json válido (framing intacto)
+        paths = {os.path.basename(o["path"]) for o in objs if "path" in o}
+        assert "linha1\nlinha2.txt" in paths, f"nome com \\n não veio íntegro: {paths}"
+        assert "normal.txt" in paths
+        assert all({"path", "size", "mtime", "nmatch", "lines"} <= set(o) for o in objs if "path" in o)
+        # nada encontrado → exit 1
+        r2 = run("-n", "zzz_inexistente_zzz", "-l", "--json", src)
+        assert r2.returncode == 1, f"nada → 1, veio {r2.returncode}"
+        # erro de expressão booleana → exit 2, com objeto de erro no stream json
+        r3 = run("-b", "(a AND", "--json", src)
+        assert r3.returncode == 2, f"erro → 2, veio {r3.returncode}"
+        errobj = _json.loads(r3.stdout.decode("utf-8", "surrogatepass").splitlines()[0])
+        assert errobj.get("error") == "boolean_expression", errobj
+        print("ok  F9b  CLI --json: framing sobrevive a \\n no nome; exit 0/1/2 estilo grep")
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+
+
 def test_preflight_flags_fat_problems():
     """Com destino FAT32, a pré-varredura tem que listar o que vai falhar
     (tamanho e nome) e a cópia pular esses itens com motivo — nunca abortar no
@@ -2267,6 +2303,7 @@ def main():
            test_dest_caps_statvfs_lies_on_vfat,
            test_dest_caps_rejects_non_utf8_names,
            test_cli_emits_bytes_for_hostile_names,
+           test_cli_json_and_exit_codes,
            test_preflight_flags_fat_problems,
            test_copy_paces_writes_on_removable,
            test_copy_into_itself, test_qt_drag_and_clipboard_payload,

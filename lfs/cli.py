@@ -7,7 +7,7 @@
 # Distribuído na esperança de ser útil, mas SEM QUALQUER GARANTIA.
 """Sombrero File Search — CLI (same core as the GUI, for scripts/daemons)."""
 from __future__ import annotations
-import argparse, os, sys, time
+import argparse, json, os, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine, version
 from engine import Query
@@ -58,7 +58,26 @@ def main():
     ap.add_argument("--days", type=int, default=0, help="modified within the last N days")
     ap.add_argument("-0", "--print0", action="store_true", help="separate paths with NUL (for xargs -0)")
     ap.add_argument("-l", "--files-only", action="store_true", help="path only (no match lines)")
+    ap.add_argument("--json", action="store_true",
+                    help="NDJSON: one object per match (path,size,mtime,nmatch,lines[]) plus "
+                         "warn events; exit code grep-style (0=found, 1=none, 2=error). For automation.")
+    ap.add_argument("--nice-io", action="store_true",
+                    help="lower CPU + I/O priority (nice 19 + ionice idle) so cron/background "
+                         "searches don't fight the server's foreground work")
     args = ap.parse_args()
+
+    if args.nice_io:                          # F9b §3.5: busca de fundo cede a vez
+        try:
+            os.nice(19)
+        except OSError:
+            pass
+        ionice = shutil.which("ionice")       # ioprio idle: sem stdlib; ionice no self
+        if ionice:                            # (os filhos rg/fd herdam a classe)
+            try:
+                subprocess.run([ionice, "-c", "3", "-p", str(os.getpid())],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
 
     parse_size = engine.parse_size            # §5: single source (was duplicated)
 
@@ -81,6 +100,7 @@ def main():
               file=sys.stderr)
     sep = "\0" if args.print0 else "\n"
     n = [0]
+    stats: dict = {}
     # Escrevemos BYTES, não texto. Nome de arquivo no Linux é uma sequência de
     # bytes que não precisa ser UTF-8 válido; o Python o carrega com
     # surrogateescape, e sys.stdout.write() morre com UnicodeEncodeError na
@@ -89,23 +109,56 @@ def main():
     wb = sys.stdout.buffer
     def emit(s):
         wb.write(os.fsencode(s))
-    def out(m):
+    def emit_json(obj):
+        # surrogatepass: nomes não-UTF-8 sobrevivem como WTF-8; o json escapa \n
+        # DENTRO da string, então um nome com quebra de linha nunca racha o NDJSON.
+        wb.write(json.dumps(obj, ensure_ascii=False).encode("utf-8", "surrogatepass"))
+        wb.write(b"\n")
+    def out_json(m):
+        n[0] += 1
+        emit_json({"path": m.path, "size": m.size, "mtime": m.mtime,
+                   "is_dir": m.is_dir, "nmatch": m.nmatch,
+                   "lines": [[ln, txt] for ln, txt in m.lines]})
+    def out_text(m):
         n[0] += 1
         if args.files_only or not m.lines:
             emit(m.path + sep)
         else:
             for ln, txt in m.lines:
                 emit(f"{m.path}:{ln}:{txt}{sep}")
+    out = out_json if args.json else out_text
+    err = None
     if args.boolexpr:
         import boolean
         try:
-            tot, dt = boolean.search_boolean(q, args.boolexpr, out)
+            tot, dt = boolean.search_boolean(q, args.boolexpr, out, stats=stats)
         except boolean.BooleanError as e:
-            print(f"boolean expression error: {e}", file=sys.stderr); sys.exit(2)
+            if args.json:
+                emit_json({"error": "boolean_expression", "detail": str(e)}); wb.flush()
+            print(f"boolean expression error: {e}", file=sys.stderr)
+            sys.exit(2)
     else:
-        tot, dt = engine.search(q, out)
+        tot, dt = engine.search(q, out, stats=stats)
+    # F9a §2.2 + F9b §3.4: avisos NO MESMO stream (json) e no stderr (texto) —
+    # montagem de rede morta pulada e diretórios sem permissão. Parcial anunciado.
+    skipped = stats.get("skipped_mounts") or []
+    denied = stats.get("denied", 0)
+    if args.json:
+        for sk in skipped:
+            emit_json({"warn": "mount_dead", "path": sk.get("path"),
+                       "mount": sk.get("mount"), "fstype": sk.get("fstype")})
+        if denied:
+            emit_json({"warn": "denied", "count": denied})
     wb.flush()
+    for sk in skipped:
+        print(f"# warning: mount not responding — skipped: {sk.get('mount')} "
+              f"({sk.get('fstype')})", file=sys.stderr)
+    if denied:
+        print(f"# warning: {denied} directories without permission — partial results",
+              file=sys.stderr)
     print(f"\n# {tot} files · {dt:.2f}s", file=sys.stderr)
+    # contrato de exit code estilo grep: 0=achou, 1=nada, 2=erro (F9b §3.1)
+    sys.exit(0 if tot > 0 else 1)
 
 
 if __name__ == "__main__":
