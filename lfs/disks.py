@@ -94,6 +94,38 @@ def _dev_for_path(ap: str) -> str:
     return _mount_entry(ap)[0]
 
 
+def _udev_unescape(name: str) -> str:
+    r"""Nomes em /dev/disk/by-label vêm com escape udev: espaço = \x20, etc."""
+    return re.sub(r"\\x([0-9a-fA-F]{2})",
+                  lambda m: chr(int(m.group(1), 16)), name)
+
+
+def volume_label(mp: str, mounts=None):
+    """Rótulo amigável do volume montado em `mp` (ex.: 'DiscoL'), para a UI
+    preferir o nome ao mountpoint cru. Fontes, em ordem:
+      1. /dev/disk/by-label/<label> cujo alvo é o MESMO dev de `mp`;
+      2. basename de `mp` sob /media ou /run/media (o auto-mount costuma nomear
+         a pasta pelo próprio label).
+    Devolve None quando nada é melhor que o mountpoint (ex.: /mnt/dados à mão).
+    Só faz syscalls locais (/dev, string) — nunca toca o conteúdo da montagem."""
+    dev = _mount_entry(mp, mounts)[0]
+    if dev.startswith("/dev/"):
+        real_dev = os.path.realpath(dev)
+        bylabel = "/dev/disk/by-label"
+        try:
+            for name in os.listdir(bylabel):
+                if os.path.realpath(os.path.join(bylabel, name)) == real_dev:
+                    return _udev_unescape(name)
+        except OSError:
+            pass
+    for prefix in ("/media/", "/run/media/"):
+        if mp.startswith(prefix):
+            base = os.path.basename(mp.rstrip("/"))
+            if base:
+                return base
+    return None
+
+
 def _rotational(dev: str):
     """'1'/'0' de /sys/block/<disco>/queue/rotational p/ o disco que sustenta o nó
     `dev` (sobe da partição p/ o disco inteiro). None se desconhecido."""

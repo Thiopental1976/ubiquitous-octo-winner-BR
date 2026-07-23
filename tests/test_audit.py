@@ -2503,6 +2503,23 @@ def test_a3_same_op_sanitize_collision():
         shutil.rmtree(src, ignore_errors=True); shutil.rmtree(dst, ignore_errors=True)
 
 
+def test_volume_label_prefers_label():
+    """Menu de discos: preferir o LABEL do volume ao mountpoint cru (pedido do
+    Rodrigo). Fallback determinístico sob /media|/run/media = basename da pasta
+    (o auto-mount a nomeia pelo label); unescape udev de \\x20 etc.; /mnt à mão
+    sem label devolve None (a GUI então mostra o mountpoint)."""
+    assert disks._udev_unescape("Disco\\x20Grande") == "Disco Grande"
+    assert disks._udev_unescape("DiscoL") == "DiscoL"
+    # dev vazio (não-/dev) => pula a varredura de by-label e usa o fallback
+    M = disks._read_mounts([
+        "server:/vol /run/media/rodrigo/DiscoL fuse.sshfs rw 0 0\n",
+        "x /mnt/dados ext4 rw 0 0\n",     # dev não-/dev p/ forçar o fallback
+    ])
+    assert disks.volume_label("/run/media/rodrigo/DiscoL", M) == "DiscoL"
+    assert disks.volume_label("/mnt/dados", M) is None   # sem label -> mountpoint
+    print("ok  discos: volume_label prefere o rótulo (fallback /media + unescape udev)")
+
+
 def test_result_filter_predicate():
     """F10a #1: o filtro-nos-resultados é um predicado PURO sobre linhas já
     carregadas (nome, caminho, mtime) — substring casa nome OU caminho, '*.odt'
@@ -2756,8 +2773,9 @@ def main():
            test_deb_version_is_dpkg_comparable,
            test_deb_package_builds_and_is_well_formed,
            test_appimage_recipe_is_coherent,
-           # F10a — filtro-nos-resultados + narrativa por root
+           # F10a — filtro-nos-resultados + narrativa por root + discos por label
            test_result_filter_predicate, test_root_events_stream,
+           test_volume_label_prefers_label,
            # F10b — a milha final humana (humane.py: nenhum errno vivo na tela)
            test_humane_maps_errno, test_humane_passthrough_and_context,
            test_gui_errors_go_through_humane,

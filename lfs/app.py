@@ -40,7 +40,7 @@ except ImportError:                     # QtMultimedia opcional (portabilidade)
     HAS_MEDIA = False
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import engine, boolean, disks, fileops, xdg, version, searches, humane
+import engine, boolean, disks, fileops, xdg, version, searches, humane, resultfilter
 from engine import Query, Match
 from i18n import t
 
@@ -80,6 +80,13 @@ def human_size(n: int) -> str:
             return f"{int(f)} {u}" if u == "B" else f"{f:.1f} {u}"
         f /= 1024
     return f"{f:.1f} TB"
+
+
+def _grp(n: int) -> str:
+    """Agrupa milhares para o contador ("3.000"/"3,000"). Separador segue o idioma."""
+    import i18n as _i18n
+    sep = "." if _i18n.current_lang() == "pt" else ","
+    return f"{int(n):,}".replace(",", sep)
 
 
 parse_size = engine.parse_size          # §5: fonte única (era duplicado aqui e no cli)
@@ -318,6 +325,29 @@ class ResultModel(QAbstractTableModel):
         rows = sorted({i.row() for i in indexes if i.isValid()})
         paths = [self.rows[r].path for r in rows if 0 <= r < len(self.rows)]
         return build_paths_mime(paths)
+
+
+class ResultFilterProxy(QSortFilterProxyModel):
+    """F10a #1 — filtro DENTRO dos resultados. Aplica o predicado puro do
+    resultfilter sobre o Match JÁ carregado (nome, caminho, mtime lidos do
+    UserRole) — nunca toca disco. Ordenação de coluna segue funcionando (herda
+    do QSortFilterProxyModel). Filtro vazio => aceita tudo (caminho rápido)."""
+    def __init__(self):
+        super().__init__()
+        self._pred = None
+        self.setSortRole(ResultModel.SORT_ROLE)
+
+    def set_filter_text(self, text: str):
+        text = (text or "").strip()
+        self._pred = resultfilter.compile_filter(text) if text else None
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, row, parent):
+        if self._pred is None:
+            return True
+        m = self.sourceModel().rows[row]     # Match; sem I/O — dados em memória
+        name = os.path.basename(m.path)
+        return self._pred(name, m.path, m.mtime)
 
 
 # ----------------------------------------------------------------- temas
@@ -908,9 +938,8 @@ class SearchTab(QWidget):
         self.status_text = t("Ready.")
         self.form: dict = {}
         self.model = ResultModel()
-        self.proxy = QSortFilterProxyModel()          # B14: ordenação de colunas
+        self.proxy = ResultFilterProxy()              # B14 ordenação + F10a #1 filtro
         self.proxy.setSourceModel(self.model)
-        self.proxy.setSortRole(ResultModel.SORT_ROLE)
         self.table = QTableView(); self.table.setModel(self.proxy)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -936,9 +965,49 @@ class SearchTab(QWidget):
         self.table.doubleClicked.connect(win.open_file)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(win.context_menu)
+
+        # ---- F10a #1: caixa de filtro DENTRO dos resultados (triagem grátis) ----
+        # Busca cara uma vez; refinar aqui não toca disco. Fica acima da tabela.
+        filt = QFrame(); filt.setObjectName("filterbar")
+        fl = QHBoxLayout(filt); fl.setContentsMargins(10, 6, 10, 6); fl.setSpacing(8)
+        lbl_f = QLabel(t("Filter")); lbl_f.setObjectName("section")
+        self.ed_filter = QLineEdit(); self.ed_filter.setObjectName("filterfield")
+        self.ed_filter.setClearButtonEnabled(True)
+        self.ed_filter.setPlaceholderText(
+            t("narrow these results — *.odt  ·  >2019-01  ·  space = AND   (Ctrl+F)"))
+        self.ed_filter.setToolTip(t(
+            "Filters the results already found — never touches the disk.\n"
+            "substring matches name or path · *.odt filters extension ·\n"
+            ">2019-01 / <2020-01 filter the date · a space means AND."))
+        self.ed_filter.textChanged.connect(self._on_filter_changed)
+        self.lbl_filter = QLabel(""); self.lbl_filter.setObjectName("section")
+        fl.addWidget(lbl_f); fl.addWidget(self.ed_filter, 1); fl.addWidget(self.lbl_filter)
+        self.filter_bar = filt
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.addWidget(self.filter_bar)
         lay.addWidget(self.table)
+        # o contador vivo "3.000 → 214" segue o modelo enchendo e o filtro mudando
+        self.model.rowsInserted.connect(self._update_filter_count)
+        self.model.modelReset.connect(self._update_filter_count)
+        self.proxy.rowsInserted.connect(self._update_filter_count)
+        self.proxy.rowsRemoved.connect(self._update_filter_count)
+        self._update_filter_count()
+
+    def _on_filter_changed(self, text):
+        self.proxy.set_filter_text(text)
+        self._update_filter_count()
+
+    def _update_filter_count(self, *a):
+        total = self.model.rowCount()
+        shown = self.proxy.rowCount()
+        if self.ed_filter.text().strip() and total:
+            self.lbl_filter.setText(t("{shown} of {total}",
+                                      shown=_grp(shown), total=_grp(total)))
+        else:
+            self.lbl_filter.setText("")
 
     @property
     def searching(self) -> bool:
@@ -1084,6 +1153,7 @@ class MainWindow(QMainWindow):
                                     "(/mnt, /media, /run/media) from the 'In' folder list."))
         self.btn_disks.setPopupMode(QToolButton.InstantPopup)
         self.mnu_disks = QMenu(self)
+        self.mnu_disks.setToolTipsVisible(True)          # mostra o mountpoint no hover
         self.mnu_disks.aboutToShow.connect(self._fill_disks_menu)
         self.btn_disks.setMenu(self.mnu_disks)
         r2.addWidget(lbl_c); r2.addWidget(self.ed_content, 3)
@@ -1333,8 +1403,15 @@ class MainWindow(QMainWindow):
             aa.toggled.connect(self._toggle_all_disks)
             self.mnu_disks.addSeparator()
         for mp in [home] + mounts:
-            label = t("Home folder (~)") if mp == home else mp
+            if mp == home:
+                label, tip = t("Home folder (~)"), home
+            else:
+                # preferência: nome do volume (label) ao mountpoint cru — o
+                # mountpoint fica no tooltip, ainda descobrível.
+                vol = disks.volume_label(mp)
+                label, tip = (vol or mp), mp
             a = self.mnu_disks.addAction(label)
+            a.setToolTip(tip)
             a.setCheckable(True); a.setChecked(mp in cur)
             a.toggled.connect(lambda on, mp=mp: self._toggle_path(mp, on))
         if not mounts:

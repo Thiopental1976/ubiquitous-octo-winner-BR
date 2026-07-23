@@ -301,6 +301,18 @@ _PT = {
     "⚠  Could not write {path}: {err}": "⚠  Não consegui escrever {path}: {err}",
     "✔  Exported {n} row(s) to {path}": "✔  Exportei {n} linha(s) para {path}",
 
+    # --- F10a #1: filtro-nos-resultados ---
+    "Filter": "Filtrar",
+    "narrow these results — *.odt  ·  >2019-01  ·  space = AND   (Ctrl+F)":
+        "refine estes resultados — *.odt  ·  >2019-01  ·  espaço = E   (Ctrl+F)",
+    "Filters the results already found — never touches the disk.\n"
+    "substring matches name or path · *.odt filters extension ·\n"
+    ">2019-01 / <2020-01 filter the date · a space means AND.":
+        "Filtra os resultados já achados — nunca toca o disco.\n"
+        "trecho casa nome ou caminho · *.odt filtra extensão ·\n"
+        ">2019-01 / <2020-01 filtram a data · espaço quer dizer E.",
+    "{shown} of {total}": "{shown} de {total}",
+
     # --- humane.py (F10b #6): frases de erro humanas ---
     "The network location stopped responding.":
         "O local de rede parou de responder.",
