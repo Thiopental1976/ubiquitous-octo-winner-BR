@@ -19,7 +19,7 @@ pra interface nunca travar (foi o defeito do menu do Cinnamon: busca síncrona).
 """
 from __future__ import annotations
 import os, re, fnmatch, shutil, subprocess, json, stat, time, tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 
@@ -583,15 +583,56 @@ def _iter_content_python(q: Query, cancel, stats=None):
 
 
 # ---------------------------------------------------------------- API pública
+def _live_roots(paths, stats, probe_timeout: float = 3.0):
+    """F9a §2.2 — GATE DE DESCIDA. Antes de o walker entrar num root, se ele for
+    uma montagem de rede (NFS/CIFS/SSHFS/…), sonda `mount_alive` numa thread
+    descartável. Montagem MORTA (D-state, `stat` travado) é PULADA com aviso
+    visível em `stats['skipped_mounts']` — nunca congela o programa, nunca silêncio.
+
+    Roots locais (disco/SSD/SMR) passam direto, sem custo de sonda. Retorna a
+    lista de roots vivos, na ordem original. Se `disks` não puder ser importado
+    (uso do engine solto, sem o pacote), degrada para os paths originais."""
+    try:
+        from . import disks
+    except Exception:
+        try:
+            import disks  # type: ignore
+        except Exception:
+            return list(paths)
+    live = []
+    for root in paths:
+        try:
+            prof = disks.search_profile(root)
+        except Exception:
+            live.append(root)          # não sei classificar → não bloqueio
+            continue
+        if prof.is_network:
+            mp = prof.mountpoint or root
+            if not disks.mount_alive(mp, timeout=probe_timeout):
+                if stats is not None:
+                    stats.setdefault("skipped_mounts", []).append(
+                        {"path": root, "mount": mp, "fstype": prof.fstype,
+                         "reason": "no_response"})
+                continue
+        live.append(root)
+    return live
+
+
 def search(q: Query, on_result: Callable[[Match], None],
            cancel: Callable[[], bool] = lambda: False,
            on_progress: Callable[[int], None] = lambda n: None,
            stats: Optional[dict] = None):
     """Executa a busca chamando on_result(Match) em streaming.
     Retorna (total_encontrado, segundos). Se `stats` (dict) for passado, recebe
-    contadores como stats['denied'] (arquivos inacessíveis vistos no stderr)."""
+    contadores como stats['denied'] (arquivos inacessíveis vistos no stderr) e
+    stats['skipped_mounts'] (montagens de rede mortas puladas — F9a §2.2)."""
     t0 = time.time()
     n = 0
+    roots = _live_roots(q.paths, stats)
+    if not roots:
+        return 0, time.time() - t0
+    if roots != list(q.paths):
+        q = replace(q, paths=roots)
     if q.content:
         if RG or (q.documents and RGA):
             it = _iter_content_rg(q, cancel, stats)

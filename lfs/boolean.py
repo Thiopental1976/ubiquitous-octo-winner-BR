@@ -23,7 +23,7 @@ Sem Qt aqui. O motor devolve Matches iguais aos de engine.py (a GUI/CLI reaprove
 from __future__ import annotations
 import os, re, json, stat, subprocess, threading, tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 try:                       # funciona como pacote (-m lfs.boolean / GUI) e flat (cli.py)
     from . import engine    # RG, Query, Match, _passes_meta, _iter_content_python
@@ -555,6 +555,13 @@ def search_boolean(q: engine.Query, expr: str, on_result, cancel=lambda: False,
     nos fallbacks Python — de forma thread-safe (compatível com a opt#2)."""
     import time
     t0 = time.time()
+    # F9a §2.2 — gate de descida: monta de rede morta é pulada (aviso em stats),
+    # nunca congela. Mesmo mecanismo do engine.search().
+    roots = engine._live_roots(q.paths, stats)
+    if not roots:
+        return 0, time.time() - t0
+    if roots != list(q.paths):
+        q = replace(q, paths=roots)
     ast = parse(expr)
     cache: dict = {}
     universe_box = [None]

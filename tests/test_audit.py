@@ -1276,6 +1276,39 @@ def test_mount_alive_watchdog():
     print("ok  F9a  mount_alive: viva=True, travada=False sem congelar o chamador")
 
 
+def test_descent_gate_skips_dead_network_mount():
+    """F9a §2.2: o gate de descida (`engine._live_roots`) PULA um root de rede cuja
+    montagem não responde, registrando o aviso em stats['skipped_mounts'] — nunca
+    silêncio, nunca trava. Root local passa direto (sem custo de sonda). Root de
+    rede VIVO passa. Determinístico via monkeypatch de search_profile/mount_alive."""
+    _disks = disks
+    IOP = _disks.IOProfile
+    prof_local = IOP("rotational", "/mnt/repo", "xfs", serialize=True,
+                     is_network=False, max_workers=None, enumerate_default=True)
+    prof_dead = IOP("network", "/mnt/nas", "nfs4", serialize=False,
+                    is_network=True, max_workers=4, enumerate_default=True)
+    prof_live = IOP("network", "/mnt/nas2", "cifs", serialize=False,
+                    is_network=True, max_workers=4, enumerate_default=True)
+    by_path = {"/mnt/repo": prof_local, "/mnt/nas/x": prof_dead, "/mnt/nas2/y": prof_live}
+    alive = {"/mnt/nas": False, "/mnt/nas2": True}   # nas morto, nas2 vivo
+    orig_prof, orig_alive = _disks.search_profile, _disks.mount_alive
+    try:
+        _disks.search_profile = lambda p, mounts=None: by_path[p]
+        _disks.mount_alive = lambda mp, timeout=3.0, **k: alive[mp]
+        stats: dict = {}
+        roots = engine._live_roots(["/mnt/repo", "/mnt/nas/x", "/mnt/nas2/y"], stats)
+        assert roots == ["/mnt/repo", "/mnt/nas2/y"], f"gate errou os vivos: {roots}"
+        sk = stats.get("skipped_mounts", [])
+        assert len(sk) == 1 and sk[0]["mount"] == "/mnt/nas", f"aviso ausente/errado: {sk}"
+        assert sk[0]["fstype"] == "nfs4" and sk[0]["reason"] == "no_response"
+        # todos mortos → lista vazia (search() retorna 0 cedo, sem tocar disco)
+        _disks.mount_alive = lambda mp, timeout=3.0, **k: False
+        assert engine._live_roots(["/mnt/nas/x"], {}) == [], "root único morto = vazio"
+    finally:
+        _disks.search_profile, _disks.mount_alive = orig_prof, orig_alive
+    print("ok  F9a  gate de descida: NAS morto pulado c/ aviso, vivo passa")
+
+
 def test_dest_caps_statvfs_lies_on_vfat():
     """Achado do teste presencial (FAT32 real montado em loop): o statvfs do vfat
     responde f_namemax=1530 — 255 x 6, o pior caso de UTF-8 por unidade UTF-16.
@@ -2222,8 +2255,9 @@ def main():
            test_dest_caps_restrictive_filesystems,
            test_mount_entry_sees_mtp_gvfs,
            test_write_probe_classifies_errno, test_decide_strategy_machine,
-           # F9a — perfil de I/O de rede + watchdog de montagem morta
+           # F9a — perfil de I/O de rede + watchdog de montagem morta + gate de descida
            test_search_profile_classification, test_mount_alive_watchdog,
+           test_descent_gate_skips_dead_network_mount,
            test_part_path_respects_name_limits, test_gio_strategy_uri_and_runner,
            test_write_strategies_atomic_and_guarded, test_preflight_a2r_surfacing,
            test_a4_1_copy_bytes_excludes_too_big,
