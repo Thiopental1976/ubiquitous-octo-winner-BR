@@ -262,6 +262,15 @@ cobertura estiver furada; ver acima). **Daemon de indexação próprio, não.** 
 serviço web: quem quer busca remota usa **SSH + `--json`**. (Mesma razão de não haver
 Flatpak — ver *Instalação*.)
 
+E o **Caçador de duplicatas** (menu *Duplicatas…*) **acha, mostra e exporta** grupos de
+arquivos byte-idênticos — para CSV ou JSON — mas **nunca os apaga**. Nem com confirmação,
+nem "só a lixeira", nem "só as cópias extras". *Lê e exporta, jamais altera* é a
+identidade do produto inteira, e um botão de apagar seria o fim desse argumento: a
+decisão de qual cópia morre é do humano, no gerenciador de arquivos dele, com os olhos
+nos caminhos que o SFS mostrou. O motor de dedup é **código próprio do SFS**
+(`lfs/dupes.py`), não dependência de outro projeto, e não tem — nem deve ganhar — função
+de remoção.
+
 ## Licença
 
 **GNU GPL v3 ou posterior** ([LICENSE](LICENSE)) — `SPDX-License-Identifier: GPL-3.0-or-later`.
