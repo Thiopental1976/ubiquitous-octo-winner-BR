@@ -1329,7 +1329,6 @@ class DuplicatesPanel(QWidget):
         (cópia idêntica / versão diferente / mistura); os filhos mostram em que
         disco cada arquivo mora, com o tamanho ao lado (versões costumam diferir
         já no tamanho)."""
-        pal = THEMES[self.main.theme]
         mono = QFont("monospace"); mono.setStyleHint(QFont.Monospace)
         if not names:
             self.tree.clear()

@@ -360,10 +360,14 @@ class NameGroup:
 def name_verdicts(files, groups: List[DupGroup]) -> List[NameGroup]:
     """Classifica os `files` por basename usando os grupos de conteúdo de `_dedup`.
 
-    Chave de conteúdo por caminho: o digest do grupo em que caiu; quem não caiu em
-    grupo nenhum é único (usa o próprio caminho como chave) — dois arquivos de mesmo
-    nome mas tamanhos/conteúdos distintos nunca são hasheados juntos, então cada um
-    fica com chave própria e o nome sai como 'versões diferentes'. Sem I/O."""
+    Colapsa por inode primeiro: dois HARDLINKS são UM arquivo físico (ainda que com
+    vários nomes) — jamais uma cópia nem uma versão. Um `lstat` por caminho paga isso
+    (barato perto do hash já feito) e evita a mesma armadilha do Estágio 0 do motor.
+
+    Chave de conteúdo por arquivo físico: o digest do grupo em que caiu; quem não caiu
+    em grupo nenhum é único (usa a própria identidade de inode) — dois arquivos de
+    mesmo nome mas conteúdos distintos nunca compartilham grupo, então cada um fica
+    com chave própria e o nome sai como 'versões diferentes'."""
     from collections import Counter
     key_of: Dict[str, str] = {}
     size_of: Dict[str, int] = {}
@@ -373,15 +377,35 @@ def name_verdicts(files, groups: List[DupGroup]) -> List[NameGroup]:
                 key_of[p] = g.digest
                 size_of[p] = g.size
 
-    by_name: Dict[str, List[str]] = {}
+    # Estágio 0 da leitura por nome: colapsa hardlinks num representante por inode.
+    inode_of: Dict[str, Tuple] = {}
     for p in files:
-        by_name.setdefault(os.path.basename(p), []).append(p)
+        try:
+            st = os.lstat(p)
+            inode_of[p] = (st.st_dev, st.st_ino)
+        except OSError:
+            inode_of[p] = ("?", p)          # não resolvido: trata como único
+    rep_of: Dict[Tuple, str] = {}           # inode -> caminho representativo (o mais curto)
+    for p in files:
+        k = inode_of[p]
+        cur = rep_of.get(k)
+        if cur is None or (len(p), p) < (len(cur), cur):
+            rep_of[k] = p
+
+    def content_key(p):
+        # inodes DIFERENTES de mesmo conteúdo => mesmo digest (cópia real, gasta
+        # espaço); inode sem grupo => sua identidade física (não é cópia de ninguém).
+        return key_of.get(p) or inode_of[p]
+
+    by_name: Dict[str, List[str]] = {}
+    for k, rep in rep_of.items():
+        by_name.setdefault(os.path.basename(rep), []).append(rep)
 
     out: List[NameGroup] = []
-    for name, paths in by_name.items():
-        if len(paths) < 2:
+    for name, reps in by_name.items():
+        if len(reps) < 2:                   # 1 arquivo físico (mesmo com N hardlinks) não é dup
             continue
-        counts = Counter(key_of.get(p, p) for p in paths)
+        counts = Counter(content_key(p) for p in reps)
         distinct = len(counts)
         if distinct == 1:
             verdict = IDENTICAL
@@ -391,10 +415,10 @@ def name_verdicts(files, groups: List[DupGroup]) -> List[NameGroup]:
             verdict = MIXED
         wasted = 0
         for key, cnt in counts.items():
-            if cnt > 1:               # chave repetida => grupo de conteúdo real
-                sz = next(size_of[p] for p in paths if key_of.get(p, p) == key)
+            if cnt > 1:                     # chave repetida => grupo de conteúdo real
+                sz = next(size_of[p] for p in reps if content_key(p) == key)
                 wasted += sz * (cnt - 1)
-        out.append(NameGroup(name, sorted(paths, key=lambda p: (len(p), p)),
+        out.append(NameGroup(name, sorted(reps, key=lambda p: (len(p), p)),
                              verdict, wasted))
     # o que rende mais espaço e mais membros primeiro; nome como desempate estável
     out.sort(key=lambda ng: (ng.wasted, len(ng.members), ng.name), reverse=True)

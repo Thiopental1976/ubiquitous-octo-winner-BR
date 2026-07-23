@@ -2968,6 +2968,161 @@ def test_dupes_name_verdicts_diff_size_is_divergent_without_hash():
     print("ok  F10c resultados: mesmo nome + tamanho diferente = versão (sem hash)")
 
 
+def test_dupes_in_files_hardlink_not_duplicate():
+    """F10c/resultados (bateria adversarial) — HARDLINK na lista de resultados: dois
+    nomes, UM inode. Não é cópia (não gasta espaço) nem versão. O achado do Fable:
+    antes saíam como 'versões diferentes'. Testa nome igual E nomes diferentes."""
+    payload = b"H" * 200000
+    d = _dup_tree({"A/foo.bin": payload})
+    try:
+        p1 = os.path.join(d, "A", "foo.bin")
+        os.makedirs(os.path.join(d, "B"))
+        p2 = os.path.join(d, "B", "foo.bin"); os.link(p1, p2)      # mesmo nome
+        p3 = os.path.join(d, "A", "bar.bin"); os.link(p1, p3)      # nome diferente
+        files = [p1, p2, p3]
+        groups = dupes.find_duplicates_in_files(files)
+        assert groups == [], f"1 inode não é grupo de conteúdo: {[g.paths for g in groups]}"
+        ngs = dupes.name_verdicts(files, groups)
+        assert ngs == [], f"hardlinks (1 arquivo físico) não são dup: {[(n.name,n.verdict) for n in ngs]}"
+        print("ok  F10c/resultados: hardlink na lista não vira cópia nem versão")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_in_files_hardlink_plus_real_copy():
+    """F10c/resultados — inode A com dois hardlinks de mesmo nome + inode B, arquivo
+    FÍSICO distinto de conteúdo idêntico e mesmo nome. Colapsa os hardlinks num só e
+    conta B: são 2 arquivos físicos idênticos → cópia (1 recuperável), não 3."""
+    payload = b"K" * 200000
+    d = _dup_tree({"DiscoL/v.mp4": payload, "Expansion1/v.mp4": payload})
+    try:
+        a = os.path.join(d, "DiscoL", "v.mp4")
+        hard = os.path.join(d, "DiscoL", "sub"); os.makedirs(hard)
+        a2 = os.path.join(hard, "v.mp4"); os.link(a, a2)           # hardlink de A
+        b = os.path.join(d, "Expansion1", "v.mp4")                 # inode físico distinto
+        files = [a, a2, b]
+        ngs = {n.name: n for n in dupes.name_verdicts(files, dupes.find_duplicates_in_files(files))}
+        assert set(ngs) == {"v.mp4"}, set(ngs)
+        assert ngs["v.mp4"].verdict == dupes.IDENTICAL
+        assert len(ngs["v.mp4"].members) == 2, "hardlinks colapsam: 2 físicos, não 3"
+        assert ngs["v.mp4"].wasted == 200000, "1 cópia recuperável, não 2"
+        print("ok  F10c/resultados: hardlink colapsa; a cópia física real conta")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_in_files_same_head_diff_tail():
+    """F10c/resultados — cabeça idêntica além dos 64 KiB mas cauda diferente: mesmo
+    tamanho e mesmo nome, ainda assim VERSÕES (o hash completo separa)."""
+    head = b"H" * (dupes.HEAD_BYTES + 4096)
+    d = _dup_tree({"DiscoL/rel.dat": head + b"AAAA", "Expansion1/rel.dat": head + b"BBBB"})
+    try:
+        files = [os.path.join(dp, fn) for dp, _dn, fns in os.walk(d) for fn in fns]
+        groups = dupes.find_duplicates_in_files(files)
+        assert groups == [], f"cauda diferente não agrupa: {[g.paths for g in groups]}"
+        ngs = dupes.name_verdicts(files, groups)
+        assert len(ngs) == 1 and ngs[0].verdict == dupes.DIVERGENT
+        print("ok  F10c/resultados: cabeça igual + cauda diferente = versão")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_in_files_cancel_leaves_no_state():
+    """F10c/resultados — cancelar no meio devolve [] limpo, igual à varredura."""
+    payload = b"z" * (4 << 20)
+    d = _dup_tree({"a.bin": payload, "b.bin": payload})
+    try:
+        files = [os.path.join(d, "a.bin"), os.path.join(d, "b.bin")]
+        seen = {"n": 0}
+        def cancel():
+            seen["n"] += 1
+            return seen["n"] > 3
+        assert dupes.find_duplicates_in_files(files, cancel=cancel) == []
+        print("ok  F10c/resultados: cancel no meio retorna [] limpo")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_in_files_missing_and_denied_counted():
+    """F10c/resultados — caminho inexistente E ilegível na lista são CONTADOS em
+    denied, não travam; os legíveis ainda são comparados (padrão F9b)."""
+    if os.geteuid() == 0:
+        print("--  F10c/resultados denied (pulado: root)"); return
+    payload = b"dado duplicado" * 2000
+    d = _dup_tree({"ok1.bin": payload, "ok2.bin": payload, "fechado.bin": payload})
+    try:
+        os.chmod(os.path.join(d, "fechado.bin"), 0o000)
+        files = [os.path.join(d, "ok1.bin"), os.path.join(d, "ok2.bin"),
+                 os.path.join(d, "fechado.bin"), os.path.join(d, "sumiu.bin")]
+        st = dupes.new_stats()
+        groups = dupes.find_duplicates_in_files(files, stats=st)
+        assert st["denied"] >= 2, f"inexistente + ilegível deviam contar: {st}"
+        assert len(groups) == 1 and len(groups[0].members) == 2, \
+            f"os legíveis deviam agrupar: {[g.paths for g in groups]}"
+        print("ok  F10c/resultados: inexistente+ilegível contados, caça continua")
+    finally:
+        os.chmod(os.path.join(d, "fechado.bin"), 0o644)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_in_files_symlink_and_zero_excluded():
+    """F10c/resultados — symlink na lista fica fora; tamanho 0 fora por padrão."""
+    d = _dup_tree({"vazio1.bin": b"", "vazio2.bin": b"", "real.bin": b"conteudo" * 50})
+    try:
+        link = os.path.join(d, "atalho.bin")
+        os.symlink(os.path.join(d, "real.bin"), link)
+        files = [os.path.join(d, "vazio1.bin"), os.path.join(d, "vazio2.bin"),
+                 os.path.join(d, "real.bin"), link]
+        st = dupes.new_stats()
+        assert dupes.find_duplicates_in_files(files, stats=st) == []
+        assert st["symlinks"] >= 1, f"symlink não contado: {st}"
+        g2 = dupes.find_duplicates_in_files(files, include_zero=True)
+        assert len(g2) == 1 and len(g2[0].members) == 2, \
+            f"vazios agrupam com include_zero: {[g.paths for g in g2]}"
+        print("ok  F10c/resultados: symlink fora + zero fora por padrão")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_in_files_cross_name_copy_grouped():
+    """F10c/resultados — o dedup de CONTEÚDO acha cópias mesmo com NOMES diferentes
+    (o name_verdicts não as veria, mas o grupo existe e é exportável)."""
+    payload = b"C" * 200000
+    d = _dup_tree({"DiscoL/ferias.mp4": payload, "Expansion1/viagem.mp4": payload})
+    try:
+        files = [os.path.join(dp, fn) for dp, _dn, fns in os.walk(d) for fn in fns]
+        groups = dupes.find_duplicates_in_files(files)
+        assert len(groups) == 1 and len(groups[0].members) == 2, \
+            f"cópia de nome diferente devia agrupar: {[g.paths for g in groups]}"
+        assert dupes.name_verdicts(files, groups) == [], "nomes diferentes: sem grupo por nome"
+        print("ok  F10c/resultados: cópia com nome diferente agrupa por conteúdo")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_in_files_hostile_names_export():
+    """F10c/resultados — nomes com bytes não-UTF-8 (acervo hostil) atravessam a
+    análise por lista E a exportação sem estourar (surrogateescape)."""
+    d = tempfile.mkdtemp(prefix="lfs_dup_")
+    try:
+        payload = b"X" * 100000
+        bad = b"v\xffdeo.mp4"                       # byte 0xFF ilegal em UTF-8
+        n1 = os.path.join(os.fsencode(d), b"A_" + bad)
+        n2 = os.path.join(os.fsencode(d), b"B_" + bad)
+        for n in (n1, n2):
+            with open(n, "wb") as f:
+                f.write(payload)
+        files = [os.fsdecode(n1), os.fsdecode(n2)]
+        groups = dupes.find_duplicates_in_files(files)
+        assert len(groups) == 1, f"nomes hostis deviam agrupar: {len(groups)}"
+        out = os.path.join(d, "dup.csv")
+        dupes.export(groups, out, "csv")            # não pode estourar
+        assert os.path.getsize(out) > 0
+        print("ok  F10c/resultados: nomes não-UTF-8 sobrevivem à análise e ao export")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_dupes_parity_with_oracle():
     """F10c — PARIDADE: no mesmo fixture (sem hardlinks), os grupos do dupes.py
     nativo == os grupos do motor do cedro (dedup_layer1), que é o ORÁCULO. Ambos
@@ -3208,6 +3363,14 @@ def main():
            test_dupes_in_files_matches_walk,
            test_dupes_name_verdicts_copy_version_mixed,
            test_dupes_name_verdicts_diff_size_is_divergent_without_hash,
+           test_dupes_in_files_hardlink_not_duplicate,
+           test_dupes_in_files_hardlink_plus_real_copy,
+           test_dupes_in_files_same_head_diff_tail,
+           test_dupes_in_files_cancel_leaves_no_state,
+           test_dupes_in_files_missing_and_denied_counted,
+           test_dupes_in_files_symlink_and_zero_excluded,
+           test_dupes_in_files_cross_name_copy_grouped,
+           test_dupes_in_files_hostile_names_export,
            test_dupes_parity_with_oracle,
            # Campanha 2 / Bloco 1 — paridade rg ↔ fallback Python
            test_parity_directed_and_property]
