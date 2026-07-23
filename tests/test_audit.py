@@ -11,7 +11,7 @@ import os, sys, time, subprocess, tempfile, shutil, errno
 
 RAIZ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, os.path.join(RAIZ, "lfs"))
-import engine, boolean, i18n, humane
+import engine, boolean, i18n, humane, dupes
 from engine import Query
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_parity_rg_python import test_parity_directed_and_property
@@ -2714,6 +2714,222 @@ def test_gui_errors_go_through_humane():
     print("ok  F10b guarda-AST: app.py roteia todo erro por humane.human_error")
 
 
+# ================================================================= F10c: duplicatas
+def _dup_tree(spec: dict):
+    """Cria uma árvore temporária. spec: nome_arquivo -> conteúdo(bytes). Retorna
+    a raiz. Sem hardlinks aqui (quem quer hardlink cria à parte)."""
+    d = tempfile.mkdtemp(prefix="lfs_dup_")
+    for name, content in spec.items():
+        p = os.path.join(d, name)
+        os.makedirs(os.path.dirname(p), exist_ok=True) if os.path.dirname(name) else None
+        with open(p, "wb") as f:
+            f.write(content)
+    return d
+
+
+def test_dupes_hardlink_is_not_duplicate():
+    """F10c — O TESTE MAIS IMPORTANTE DA FASE: dois hardlinks são o MESMO arquivo
+    (um inode), jamais uma 'duplicata'. Reportá-los convidaria a 'liberar espaço'
+    apagando o que não ocupa espaço nenhum."""
+    d = _dup_tree({"a.bin": b"conteudo identico" * 100})
+    try:
+        os.link(os.path.join(d, "a.bin"), os.path.join(d, "b.bin"))   # hardlink
+        st = dupes.new_stats()
+        groups = dupes.find_duplicates([d], include_zero=True, stats=st)
+        assert groups == [], f"hardlink virou duplicata (bug de identidade!): {[g.paths for g in groups]}"
+        assert st["candidates"] == 1, f"os dois nomes deviam colapsar em 1 candidato: {st}"
+        print("ok  F10c hardlink NÃO é duplicata (um inode = um candidato)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_real_duplicate_across_devices_groups():
+    """F10c — dupla byte-idêntica agrupa MESMO em dispositivos diferentes: o
+    st_dev entra só na ORDEM de leitura (sequencial por disco), nunca na chave do
+    grupo. Simula devs distintos monkeypatchando lstat."""
+    payload = b"video frame data \x00\xff" * 500
+    d = _dup_tree({"disco1.mp4": payload, "disco2.mp4": payload,
+                   "unico.mp4": payload + b"x"})
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *a, **k):
+        st = real_lstat(path, *a, **k)
+        if path.endswith("disco2.mp4"):        # finge que está noutro disco
+            fields = list(st)
+            fields[2] = st.st_dev + 1           # st_dev é o índice 2 do stat_result
+            return os.stat_result(fields)
+        return st
+
+    try:
+        orig = os.lstat
+        os.lstat = fake_lstat
+        try:
+            groups = dupes.find_duplicates([d], include_zero=True)
+        finally:
+            os.lstat = orig
+        assert len(groups) == 1, f"esperava 1 grupo, veio {len(groups)}"
+        names = sorted(os.path.basename(p) for p in groups[0].paths)
+        assert names == ["disco1.mp4", "disco2.mp4"], names
+        assert groups[0].wasted == len(payload), f"desperdício errado: {groups[0].wasted}"
+        print("ok  F10c dupla real em discos diferentes agrupa (dev só ordena)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_same_head_different_tail_separates():
+    """F10c — cabeça igual + resto diferente NÃO pode agrupar: o estágio 3 (hash
+    completo) tem de separar quem o estágio 2 (cabeça) deixou junto."""
+    head = b"H" * (dupes.HEAD_BYTES + 10)        # cabeça idêntica > 64 KiB
+    a = head + b"AAAA"
+    b = head + b"BBBB"                            # mesmo tamanho, cauda diferente
+    d = _dup_tree({"a.bin": a, "b.bin": b})
+    try:
+        groups = dupes.find_duplicates([d])
+        assert groups == [], f"cauda diferente devia separar: {[g.paths for g in groups]}"
+        print("ok  F10c cabeça igual + cauda diferente separa no estágio 3")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_cancel_leaves_no_state():
+    """F10c — cancelar no meio devolve [] limpo (sem grupos-fantasma). Cancel
+    disparado já no primeiro chunk do hash completo."""
+    payload = b"z" * (4 << 20)                    # 4 MiB, garante vários blocos
+    d = _dup_tree({"a.bin": payload, "b.bin": payload})
+    try:
+        seen = {"n": 0}
+
+        def cancel():
+            seen["n"] += 1
+            return seen["n"] > 3                  # deixa varrer/cabeça, corta no full
+        groups = dupes.find_duplicates([d], cancel=cancel)
+        assert groups == [], f"cancel devia devolver [] limpo, veio {groups}"
+        print("ok  F10c cancel no meio não deixa estado (retorna [])")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_denied_counted():
+    """F10c — arquivo ilegível (EACCES) é CONTADO em stats['denied'] e anunciado,
+    não trava a caça (padrão F9b)."""
+    if os.geteuid() == 0:
+        print("--  F10c denied (pulado: root ignora permissões)"); return
+    payload = b"segredo duplicado" * 1000
+    d = _dup_tree({"aberto1.bin": payload, "aberto2.bin": payload, "fechado.bin": payload})
+    try:
+        os.chmod(os.path.join(d, "fechado.bin"), 0o000)
+        st = dupes.new_stats()
+        groups = dupes.find_duplicates([d], stats=st)
+        assert st["denied"] >= 1, f"não contou o ilegível: {st}"
+        # os dois legíveis ainda agrupam
+        assert len(groups) == 1 and len(groups[0].members) == 2, \
+            f"os legíveis deviam agrupar apesar do ilegível: {[g.paths for g in groups]}"
+        print("ok  F10c EACCES contado em stats['denied'] e a caça continua")
+    finally:
+        os.chmod(os.path.join(d, "fechado.bin"), 0o644)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_symlinks_and_zero_excluded():
+    """F10c — symlinks ficam de fora (não são arquivo físico) e tamanho 0 sai por
+    padrão (todos os vazios são 'iguais'); include_zero liga."""
+    d = _dup_tree({"vazio1.bin": b"", "vazio2.bin": b"", "real.bin": b"conteudo" * 50})
+    try:
+        os.symlink(os.path.join(d, "real.bin"), os.path.join(d, "atalho.bin"))
+        st = dupes.new_stats()
+        groups = dupes.find_duplicates([d], stats=st)     # sem include_zero
+        assert groups == [], f"vazios/symlink não deviam gerar grupo: {[g.paths for g in groups]}"
+        assert st["symlinks"] >= 1, f"symlink não contado: {st}"
+        # com include_zero, os dois vazios agrupam (e o symlink continua fora)
+        g2 = dupes.find_duplicates([d], include_zero=True)
+        assert len(g2) == 1 and len(g2[0].members) == 2, \
+            f"vazios deviam agrupar com include_zero: {[g.paths for g in g2]}"
+        print("ok  F10c symlink fora + tamanho 0 fora por padrão (include_zero liga)")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dupes_no_delete_api():
+    """F10c — a LINHA VERMELHA como teste-guarda: dupes.py acha/mostra/exporta,
+    NÃO apaga. Nenhuma função de remoção, nenhum os.remove/unlink/rmtree/rename
+    no módulo. Um botão de apagar aqui seria a morte do argumento do produto."""
+    import ast
+    src = os.path.join(RAIZ, "lfs", "dupes.py")
+    with open(src, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=src)
+    banned_attr = {"remove", "unlink", "rmtree", "rmdir", "rename", "replace", "truncate"}
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in banned_attr:
+            offenders.append((getattr(node, "lineno", "?"), node.attr))
+        if isinstance(node, ast.FunctionDef) and any(
+                w in node.name.lower() for w in ("delete", "remove", "apaga", "trash")):
+            offenders.append((node.lineno, "def " + node.name))
+    assert not offenders, f"dupes.py NÃO pode alterar/apagar nada: {offenders}"
+    print("ok  F10c linha-vermelha: dupes.py não tem API destrutiva (só acha/exporta)")
+
+
+def test_dupes_parity_with_oracle():
+    """F10c — PARIDADE: no mesmo fixture (sem hardlinks), os grupos do dupes.py
+    nativo == os grupos do motor do cedro (dedup_layer1), que é o ORÁCULO. Ambos
+    devem achar exatamente os mesmos conjuntos byte-idênticos."""
+    oracle_path = "/home/rodrigo/atriz_recog/dedup_layer1.py"
+    if not os.path.exists(oracle_path):
+        print("--  F10c paridade (pulado: oráculo dedup_layer1.py ausente)"); return
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dedup_layer1", oracle_path)
+    oracle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oracle)
+
+    A = b"alpha" * 5000            # 3 cópias
+    B = b"bravo" * 5000            # 2 cópias
+    C = b"charlie" * 5000          # único
+    D = b"delta" * 4000            # 2 cópias, tamanho diferente de A/B
+    d = _dup_tree({"a1.dat": A, "sub/a2.dat": A, "a3.dat": A,
+                   "b1.dat": B, "b2.dat": B, "c1.dat": C,
+                   "d1.dat": D, "sub/d2.dat": D})
+    try:
+        # nosso motor
+        mine = dupes.find_duplicates([d], include_zero=True)
+        mine_sets = {frozenset(g.paths) for g in mine}
+
+        # oráculo: replica a lógica dele (tamanho -> phash -> fhash) com os arquivos
+        # reais do fixture, usando as PRÓPRIAS funções de hash dele.
+        import collections
+        allpaths = []
+        for dp, _dn, fns in os.walk(d):
+            for fn in fns:
+                allpaths.append(os.path.join(dp, fn))
+        bysize = collections.defaultdict(list)
+        for p in allpaths:
+            bysize[os.path.getsize(p)].append(p)
+        oracle_sets = set()
+        for sz, ps in bysize.items():
+            if len(ps) < 2:
+                continue
+            byp = collections.defaultdict(list)
+            for p in ps:
+                byp[oracle.phash(p)].append(p)
+            for ph, sub in byp.items():
+                if len(sub) < 2:
+                    continue
+                byf = collections.defaultdict(list)
+                for p in sub:
+                    byf[oracle.fhash(p)].append(p)
+                for fh, g in byf.items():
+                    if len(g) > 1:
+                        oracle_sets.add(frozenset(g))
+
+        assert mine_sets == oracle_sets, (
+            "divergência com o oráculo:\n  meu   = %r\n  oráculo = %r"
+            % (sorted(map(sorted, mine_sets)), sorted(map(sorted, oracle_sets))))
+        # sanidade: achou os 3 grupos esperados (A×3, B×2, D×2)
+        assert len(mine_sets) == 3, f"esperava 3 grupos, veio {len(mine_sets)}"
+        print("ok  F10c paridade com o oráculo (dedup_layer1): mesmos grupos")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     fns = [test_parse_size, test_reap_kills_process, test_no_orphan_on_cancel,
            test_glob_case_insensitive, test_boolean_name_regex,
@@ -2779,6 +2995,13 @@ def main():
            # F10b — a milha final humana (humane.py: nenhum errno vivo na tela)
            test_humane_maps_errno, test_humane_passthrough_and_context,
            test_gui_errors_go_through_humane,
+           # F10c — caçador de duplicatas NATIVO (acha/mostra/exporta, jamais apaga)
+           test_dupes_hardlink_is_not_duplicate,
+           test_dupes_real_duplicate_across_devices_groups,
+           test_dupes_same_head_different_tail_separates,
+           test_dupes_cancel_leaves_no_state, test_dupes_denied_counted,
+           test_dupes_symlinks_and_zero_excluded, test_dupes_no_delete_api,
+           test_dupes_parity_with_oracle,
            # Campanha 2 / Bloco 1 — paridade rg ↔ fallback Python
            test_parity_directed_and_property]
     fail = 0
