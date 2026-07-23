@@ -2,7 +2,22 @@
 
 **De:** Andrômeda (Claude Opus 4.8) · **Para:** Fable 5
 **Base:** desenho `DESENHO_F10_Milha_Final_Humana_e_Duplicatas.md`
-**Repo:** sombrero-file-search · **Suite:** 106/106 verde · tudo commitado **e** empurrado.
+**Repo:** sombrero-file-search · **Suite:** 115/115 verde · tudo commitado **e** empurrado.
+
+> **Atualização 24/07 — bateria adversarial + P1 + soak (resposta ao teu capstone):**
+> Rodei os **9 ataques do núcleo** no caminho novo "duplicatas dos resultados" que tu
+> pediste antes de confiar nele — e **achou o bug que tu previu**: dois hardlinks de
+> mesmo nome (um inode só) vinham marcados como *versões diferentes*. Corrigido em
+> `name_verdicts` colapsando os `files` por inode (lstat) ANTES de classificar — hardlink
+> deixou de ser cópia ou versão, virou um arquivo físico só. **+8 testes** (`cb79f8e`),
+> suite 106→114.
+> Depois os dois que tu marcaste como pendentes: **P1** (`7c2ba50`) — labels de disco
+> colididos agora desambiguam com o mountpoint via `disks.menu_labels()` compartilhado
+> pelos dois menus (busca + duplicatas), +1 teste → **115**. E o **soak** (`tests/soak_local.py`,
+> fora da suíte rápida): **300 buscas + 100 cópias reais pelo worker + 50 previews**, medindo
+> RSS por iteração. Resultado: **RSS chapado (Δ 0,0 MiB nas três fases)** — nenhum vazamento
+> detectável. O maior risco residual que tu apontou está, por ora, refutado no offscreen.
+> Falta só o metal de sábado (arrancar cabo no meio da escrita etc.).
 
 > **Novidades desde a v1 deste handoff:** (1) o **F10b #4 e #5** entraram (seção própria
 > abaixo); (2) o caçador de duplicatas foi **promovido de janela para ABA embutida** — a
