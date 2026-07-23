@@ -11,7 +11,7 @@ import os, sys, time, subprocess, tempfile, shutil, errno
 
 RAIZ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, os.path.join(RAIZ, "lfs"))
-import engine, boolean, i18n, humane, dupes
+import engine, boolean, i18n, humane, dupes, disks, fileops, copyjobs
 from engine import Query
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_parity_rg_python import test_parity_directed_and_property
@@ -2966,6 +2966,106 @@ def test_dupes_parity_with_oracle():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- F10b #4/#5
+def test_eject_command_prefers_gio_then_udisks():
+    """F10b #4 — o comando de ejeção é puro e escolhe a ferramenta existente:
+    gio primeiro (o que o Nemo faz), udisksctl power-off como reserva, None quando
+    nenhuma existe (aí o botão nem aparece — sem dependência nova)."""
+    gio = disks.eject_command("/media/USB", "/dev/sdb1",
+                              which=lambda n: "/usr/bin/gio" if n == "gio" else None)
+    assert gio == ["gio", "mount", "-e", "/media/USB"], gio
+    ud = disks.eject_command("/media/USB", "/dev/sdb1",
+                             which=lambda n: "/bin/udisksctl" if n == "udisksctl" else None)
+    assert ud == ["udisksctl", "power-off", "-b", "/dev/sdb1"], ud
+    # udisksctl sem dev conhecido não tem como desligar o barramento
+    assert disks.eject_command("/media/USB", "",
+                               which=lambda n: "/bin/udisksctl" if n == "udisksctl" else None) is None
+    # nenhuma ferramenta → None
+    assert disks.eject_command("/media/USB", "/dev/sdb1", which=lambda n: None) is None
+    print("ok  F10b#4 eject_command: gio → udisksctl → None")
+
+
+def test_copyjobs_snapshot_roundtrip():
+    """F10b #5 — a fila persistida volta idêntica; vazia, remove a chave (nada a
+    perguntar na próxima abertura)."""
+    cfg = {}
+    jobs = [(["/a/x.mp4", "/a/y.mp4"], "/media/USB", False),
+            (["/b/z.mp4"], "/media/USB/sub", True)]
+    copyjobs.snapshot(cfg, jobs)
+    assert "copy_queue" in cfg
+    assert copyjobs.pending(cfg) == jobs, copyjobs.pending(cfg)
+    copyjobs.snapshot(cfg, [])
+    assert "copy_queue" not in cfg and copyjobs.pending(cfg) == []
+    print("ok  F10b#5 snapshot ida-e-volta + esvaziar limpa a chave")
+
+
+def test_copyjobs_rejects_malformed():
+    """F10b #5 — config editado à mão não pode derrubar o arranque: entradas
+    malformadas são descartadas em silêncio, as boas passam."""
+    cfg = {"copy_queue": [
+        {"dest": "/media/USB", "sources": ["/a/x"]},      # boa
+        {"dest": "", "sources": ["/a/x"]},                # dest vazio
+        {"dest": "/d", "sources": []},                    # sem fontes
+        {"dest": "/d", "sources": [1, 2]},                # fontes não-str
+        "lixo", 42, None,                                 # nem dict
+    ]}
+    assert copyjobs.pending(cfg) == [(["/a/x"], "/media/USB", False)], copyjobs.pending(cfg)
+    print("ok  F10b#5 pending() filtra entradas malformadas")
+
+
+def test_copyjobs_resume_is_idempotent():
+    """F10b #5 — O TESTE DO kill -9: 2 jobs na fila, 'morte' no meio (um arquivo já
+    copiado + um .part órfão), reabrir e retomar → estado final IDÊNTICO ao de uma
+    execução sem morte. A cópia ATOMIC é idempotente: concluído vira conflito (Pular
+    por padrão), .sombrero-part é lixo reconhecível."""
+    src = tempfile.mkdtemp(prefix="lfs_resume_src_")
+    for n, c in {"A/a1.bin": b"AAAA" * 500, "A/a2.bin": b"aaaa" * 500,
+                 "B/b1.bin": b"BBBB" * 500}.items():
+        p = os.path.join(src, n)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").write(c)
+    srcs_A = [os.path.join(src, "A", "a1.bin"), os.path.join(src, "A", "a2.bin")]
+    srcs_B = [os.path.join(src, "B", "b1.bin")]
+    skip = lambda s, d: ("skip", True)
+
+    def tree(root):
+        out = {}
+        for dp, _dirs, fs in os.walk(root):
+            for f in fs:
+                if f.endswith(fileops.PART_SUFFIX):
+                    continue
+                fp = os.path.join(dp, f)
+                out[os.path.relpath(fp, root)] = open(fp, "rb").read()
+        return out
+
+    ref = tempfile.mkdtemp(prefix="lfs_resume_ref_")
+    live = tempfile.mkdtemp(prefix="lfs_resume_live_")
+    try:
+        # referência: A e B do zero, sem morte
+        fileops.copy_to(srcs_A, ref, on_conflict=skip)
+        fileops.copy_to(srcs_B, ref, on_conflict=skip)
+
+        # vivo: começa A (só a1) + deixa um .part órfão, "morre" com [A, B] na fila
+        fileops.copy_to([srcs_A[0]], live, on_conflict=skip)
+        open(os.path.join(live, "a2.bin" + fileops.PART_SUFFIX), "wb").write(b"lixo")
+        cfg = {}
+        copyjobs.snapshot(cfg, [(srcs_A, live, False), (srcs_B, live, False)])
+
+        # reabre: lê pendentes e retoma
+        pend = copyjobs.pending(cfg)
+        assert len(pend) == 2, pend
+        for sources, dest, _san in pend:
+            fileops.copy_to(sources, dest, on_conflict=skip)
+
+        assert tree(live) == tree(ref), (sorted(tree(live)), sorted(tree(ref)))
+        copyjobs.snapshot(cfg, [])
+        assert copyjobs.pending(cfg) == []
+        print("ok  F10b#5 retomada idempotente (kill -9): estado final idêntico")
+    finally:
+        for d in (src, ref, live):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     fns = [test_parse_size, test_reap_kills_process, test_no_orphan_on_cancel,
            test_glob_case_insensitive, test_boolean_name_regex,
@@ -3031,6 +3131,10 @@ def main():
            # F10b — a milha final humana (humane.py: nenhum errno vivo na tela)
            test_humane_maps_errno, test_humane_passthrough_and_context,
            test_gui_errors_go_through_humane,
+           # F10b #4/#5 — pós-cópia "seguro remover" + fila de cópia que sobrevive
+           test_eject_command_prefers_gio_then_udisks,
+           test_copyjobs_snapshot_roundtrip, test_copyjobs_rejects_malformed,
+           test_copyjobs_resume_is_idempotent,
            # F10c — caçador de duplicatas NATIVO (acha/mostra/exporta, jamais apaga)
            test_dupes_hardlink_is_not_duplicate,
            test_dupes_real_duplicate_across_devices_groups,

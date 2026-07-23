@@ -22,7 +22,7 @@ Three jobs:
      fails at byte 4294967296, not at the start, so we check BEFORE writing.
 """
 from __future__ import annotations
-import os, re, errno, select, threading, warnings
+import os, re, errno, select, threading, warnings, shutil
 from dataclasses import dataclass
 
 try:                        # pacote (GUI) e flat (cli.py/testes)
@@ -745,6 +745,30 @@ def dest_caps(path: str) -> DestCaps:
     return DestCaps(fstype=fstype, mountpoint=mp, namemax=namemax,
                     readonly=readonly, via_gvfs=via_gvfs, removable=is_removable(dev),
                     link_mbits=link_speed(dev), **caps)
+
+
+def removable_dest(path: str, mounts=None):
+    """(removível?, mountpoint, dev) do volume que contém `path` — o que o
+    pós-cópia precisa para oferecer "seguro remover" + Ejetar (F10b #4). Sem
+    sonda de escrita: só classifica pela topologia. PURA (`mounts` injetável)."""
+    dev, mp, _fs = _mount_entry(os.path.abspath(path), mounts)
+    return is_removable(dev), mp, dev
+
+
+def eject_command(mountpoint: str, dev: str = "", *, which=None):
+    """Comando (argv) para ejetar com segurança o volume em `mountpoint`, ou None
+    quando nenhuma ferramenta existe — aí o botão simplesmente não aparece (sem
+    dependência nova; F10b #4).
+
+    Prefere `gio mount -e` (desmonta pelo gvfs/udisks e faz o flush certo, é o que
+    o Nemo faz), cai para `udisksctl power-off -b <dev>` (desliga o barramento — o
+    "pode arrancar o pendrive" de verdade). `which` injetável para os testes."""
+    which = which or shutil.which
+    if which("gio"):
+        return ["gio", "mount", "-e", mountpoint]
+    if dev and which("udisksctl"):
+        return ["udisksctl", "power-off", "-b", dev]
+    return None
 
 
 def free_bytes(path: str) -> int:

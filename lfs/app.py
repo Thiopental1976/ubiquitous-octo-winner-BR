@@ -40,7 +40,7 @@ except ImportError:                     # QtMultimedia opcional (portabilidade)
     HAS_MEDIA = False
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import engine, boolean, disks, fileops, xdg, version, searches, humane, resultfilter, dupes
+import engine, boolean, disks, fileops, xdg, version, searches, humane, resultfilter, dupes, copyjobs
 from engine import Query, Match
 from i18n import t
 
@@ -1293,6 +1293,7 @@ class MainWindow(QMainWindow):
         self._tick.timeout.connect(self._heartbeat)
         self.cfg = load_cfg()
         self.copy_q = CopyQueue()                 # F7: fila de cópia (um worker)
+        self._jobs: list = []                     # F10b #5: espelho da fila p/ persistir
         # A6: worker persistente — criado UMA vez, vive toda a sessão, dorme na
         # fila entre jobs. Fim das QThreads recriadas por arrasto (e da corrida).
         self.copier = CopyWorker(self.copy_q)
@@ -1337,6 +1338,10 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+S"), self, self.save_current_search)
         self.setAcceptDrops(True)                 # soltar pasta = "procure aqui"
         self.ed_name.setFocus()                   # digitar e Enter, sem clique
+        # F10b #5: cópias pendentes de uma sessão anterior — pergunta ao aparecer
+        # (janela já montada; singleShot deixa o show() acontecer antes do modal).
+        if copyjobs.pending(self.cfg):
+            QTimer.singleShot(0, self._maybe_resume_copies)
 
     # ---- UI
     def _build(self):
@@ -1525,9 +1530,17 @@ class MainWindow(QMainWindow):
         self.lbl_copy_rate = QLabel(""); self.lbl_copy_rate.setObjectName("subtitle")
         self.btn_copy_cancel = QPushButton(t("Cancel"))
         self.btn_copy_cancel.clicked.connect(self.cancel_copy)
+        # F10b #4: "seguro remover" — só aparece ao fim de uma cópia p/ disco
+        # removível, e só se há como ejetar (gio/udisksctl); some no resto do tempo.
+        self.btn_eject = QPushButton(t("⏏ Eject"))
+        self.btn_eject.clicked.connect(self._eject_dest)
+        self.btn_eject.setVisible(False)
         cb.addWidget(self.lbl_copy, 2); cb.addWidget(self.pb_copy, 3)
         cb.addWidget(self.lbl_copy_rate); cb.addWidget(self.btn_copy_cancel)
+        cb.addWidget(self.btn_eject)
         self.copy_bar.setVisible(False)
+        self._safe_eject = None          # (mountpoint, dev) do último destino removível
+        self._copy_t0 = None             # F10b #4: início da cópia (p/ notificar se >30s)
         root.addWidget(self.copy_bar)
 
         # ---------- status ----------
@@ -2679,13 +2692,45 @@ class MainWindow(QMainWindow):
         save_cfg(self.cfg)
         self.enqueue_copy([m.path for m in ms], dest)
 
-    def enqueue_copy(self, sources, dest):
+    def enqueue_copy(self, sources, dest, sanitize=False):
         # A6: só enfileira. O worker persistente está dormindo em get() e acorda
         # sozinho — sem recriar QThread, sem flag `running`, sem corrida.
-        self.copy_q.put((sources, dest, False))
+        job = (sources, dest, sanitize)
+        self.copy_q.put(job)
+        self._jobs.append(job)            # F10b #5: espelha p/ o snapshot persistente
+        self._snapshot_jobs()
         pending = self.copy_q.pending()
         if pending > 1:
             self.status.setText(t("Queued — {n} copy job(s) pending.", n=pending - 1))
+
+    def _snapshot_jobs(self):
+        """F10b #5: grava a fila (não concluídos) no config a cada transição. Barato
+        e o bastante — a cópia é idempotente na retomada (ver copyjobs.py)."""
+        copyjobs.snapshot(self.cfg, self._jobs)
+        save_cfg(self.cfg)
+
+    def _maybe_resume_copies(self):
+        """F10b #5: 'você tinha N cópias pendentes — retomar?'. Retomar re-enfileira
+        (a cópia ATOMIC é idempotente: concluído vira conflito, .part é lixo); o
+        destino ausente é barrado no preflight, o job só fica pendente, não some."""
+        jobs = copyjobs.pending(self.cfg)
+        if not jobs:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(t("Resume copies?"))
+        box.setText(t("You had {n} copy job(s) pending from last time.",
+                      n=len(jobs)))
+        b_resume = box.addButton(t("Resume"), QMessageBox.AcceptRole)
+        box.addButton(t("Discard"), QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is b_resume:
+            self._jobs.clear()                  # o snapshot será refeito por enqueue
+            for sources, dest, sanitize in jobs:
+                self.enqueue_copy(sources, dest, sanitize)
+        else:
+            copyjobs.clear(self.cfg)
+            save_cfg(self.cfg)
 
     def on_ask_preflight(self, pf, ask):
         dlg = PreflightDialog(self, pf)
@@ -2699,6 +2744,12 @@ class MainWindow(QMainWindow):
 
     def on_copy_started(self, dest, pending):
         self.copy_bar.setVisible(True)
+        self.pb_copy.setVisible(True)
+        self.btn_copy_cancel.setVisible(True)
+        self.btn_eject.setVisible(False)            # F10b #4: some enquanto copia
+        self._safe_eject = None
+        if self._copy_t0 is None:                   # marca o início da tanda de cópias
+            self._copy_t0 = time.monotonic()
         self.pb_copy.setRange(0, 0)                 # indeterminado durante a varredura
         self.lbl_copy.setText(t("Scanning source…"))
         self.lbl_copy_rate.setText(t("{n} pending", n=pending) if pending else "")
@@ -2713,9 +2764,23 @@ class MainWindow(QMainWindow):
             human_size(p.total_bytes)))
 
     def on_copy_done(self, res, dest):
+        # F10b #5: este job saiu da fila — atualiza o snapshot persistente. FIFO de
+        # um worker só: o que terminou é o da frente.
+        if self._jobs:
+            self._jobs.pop(0)
+        self._snapshot_jobs()
         if res is None:
             self.status.setText(t("Copy cancelled."))
             return
+        # F10b #4: destino removível + cópia que gravou algo → oferecer "seguro
+        # remover". O fsync-por-arquivo do ATOMIC torna a promessa verdadeira.
+        if res.copied and not getattr(res, "out_of_space", False):
+            try:
+                removable, mp, dev = disks.removable_dest(dest)
+            except OSError:
+                removable, mp, dev = False, "", ""
+            if removable and disks.eject_command(mp, dev) is not None:
+                self._safe_eject = (mp, dev)
         parts = [t("{n} copied", n=len(res.copied))]
         if res.skipped:
             parts.append(t("{n} skipped", n=len(res.skipped)))
@@ -2740,11 +2805,77 @@ class MainWindow(QMainWindow):
                                           for p, e in res.failed[:15]))
 
     def on_copy_all_done(self):
-        self.copy_bar.setVisible(False)
+        elapsed = (time.monotonic() - self._copy_t0) if self._copy_t0 else 0
+        self._copy_t0 = None
+        if self._safe_eject is not None:
+            # F10b #4: fila vazia + último destino removível → a barra NÃO some;
+            # vira o aviso "seguro remover" com o botão Ejetar ao lado.
+            self.pb_copy.setVisible(False)
+            self.btn_copy_cancel.setVisible(False)
+            self.lbl_copy.setText(t("Copied and synced — safe to remove."))
+            self.lbl_copy_rate.setText("")
+            self.btn_eject.setVisible(True)
+            self.copy_bar.setVisible(True)
+        else:
+            self.copy_bar.setVisible(False)
+        # F10b #4: cópia longa numa janela que o usuário deixou de lado → avisa.
+        if elapsed > 30 and (self.isMinimized() or not self.isActiveWindow()):
+            self._notify(t("Sombrero File Search"), t("Copy finished."))
+
+    def _eject_dest(self):
+        """F10b #4: desmonta/ejeta o último destino removível. Usa gio ou udisksctl
+        (o que existir); nada de dependência nova. O erro, se houver, vira frase
+        humana — nunca um errno cru na tela."""
+        if not self._safe_eject:
+            return
+        mp, dev = self._safe_eject
+        cmd = disks.eject_command(mp, dev)
+        if cmd is None:
+            return
+        import subprocess
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.status.setText(humane.human_error(e, context="eject", target=mp))
+            return
+        if r.returncode == 0:
+            self.status.setText(t("Safe to unplug now."))
+            self._safe_eject = None
+            self.copy_bar.setVisible(False)
+        else:
+            # a montagem pode estar ocupada por outro app — dá o motivo, não o code
+            msg = (r.stderr or r.stdout).strip() or t("Could not eject the disk.")
+            self.status.setText(msg)
+
+    def _notify(self, title, body):
+        """Notificação de desktop sem dependência: notify-send se existir, senão
+        a bandeja do Qt. Se nada disso rola, silêncio — é um extra, não um dever."""
+        import shutil, subprocess
+        if shutil.which("notify-send"):
+            try:
+                subprocess.Popen(["notify-send", "-a", "Sombrero File Search",
+                                  title, body])
+                return
+            except OSError:
+                pass
+        try:
+            from PySide6.QtWidgets import QSystemTrayIcon
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                tray = getattr(self, "_tray", None)
+                if tray is None:
+                    tray = QSystemTrayIcon(self.windowIcon(), self)
+                    tray.show()
+                    self._tray = tray
+                tray.showMessage(title, body)
+        except Exception:
+            pass
 
     def cancel_copy(self):
         if getattr(self, "copier", None) and self.copier.isRunning():
             self.copier.cancel_all()
+            # F10b #5: 'cancelar tudo' esvazia a fila — o snapshot acompanha.
+            self._jobs.clear()
+            self._snapshot_jobs()
             self.status.setText(t("Cancelling copy…"))
 
     # ---- F7: soltar pasta NA janela = "procure aqui" (não copia nada)

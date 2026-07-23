@@ -323,6 +323,21 @@ _PT = {
     "{verb} {done}/{total} locations · {found} found · {sec}":
         "{verb} {done}/{total} locais · {found} achados · {sec}",
 
+    # --- F10b #4: pós-cópia "seguro remover" + ejetar ---
+    "⏏ Eject": "⏏ Ejetar",
+    "Copied and synced — safe to remove.":
+        "Copiado e sincronizado — seguro remover.",
+    "Copy finished.": "Cópia concluída.",
+    "Safe to unplug now.": "Pode remover com segurança agora.",
+    "Could not eject the disk.": "Não deu para ejetar o disco.",
+
+    # --- F10b #5: fila de cópia que sobrevive ao fechamento ---
+    "Resume copies?": "Retomar cópias?",
+    "You had {n} copy job(s) pending from last time.":
+        "Você tinha {n} cópia(s) pendente(s) da última vez.",
+    "Resume": "Retomar",
+    "Discard": "Descartar",
+
     # --- F10c: caçador de duplicatas ---
     "Duplicates…": "Duplicatas…",
     "Find byte-identical files under the search paths.\n"
