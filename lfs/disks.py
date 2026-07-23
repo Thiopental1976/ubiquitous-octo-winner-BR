@@ -22,13 +22,24 @@ Three jobs:
      fails at byte 4294967296, not at the start, so we check BEFORE writing.
 """
 from __future__ import annotations
-import os, re, errno, select, threading
+import os, re, errno, select, threading, warnings
 from dataclasses import dataclass
 
 try:                        # pacote (GUI) e flat (cli.py/testes)
     from . import engine
 except ImportError:
     import engine
+
+# R2 (achado Fable, revisão 23/07): no Python 3.12+ o os.fork() da sonda de mount
+# (mount_status) emite DeprecationWarning "process is multi-threaded, use of fork()
+# may lead to deadlocks" — a GUI tem QThreads sempre vivas, então seria um aviso por
+# sonda no stderr. O uso AQUI é dos seguros: o filho só faz syscalls (stat/close/
+# write) + os._exit, NUNCA toca um lock herdado do pai (não há alloc, logging, nem
+# import no caminho do filho). Silenciamos ESTE aviso específico. Um filtro global
+# instalado uma vez é thread-safe; warnings.catch_warnings() em volta do fork NÃO é
+# (mexe em estado global) — justo o que não se quer num processo multi-thread.
+warnings.filterwarnings("ignore", category=DeprecationWarning,
+                        message=r".*multi-threaded.*fork.*")
 
 
 # ------------------------------------------------------------------ topologia
@@ -241,10 +252,33 @@ def mount_status(mp: str, timeout: float = 3.0, _stat=os.stat) -> str:
     pid = os.fork()
     if pid == 0:
         # FILHO: só stat + 1 byte + _exit. Nada de finally/atexit do pai (os._exit).
+        #
+        # R1 (achado Fable, revisão 23/07): o "hang só na primeira vez" NÃO era
+        # cold-start do FUSE — e ESTE filho segurando as fds herdadas do pai. Preso
+        # em D-state (stat de mount morto, ininterruptível), ele mantém o stdout /
+        # stderr do pai ABERTOS; um leitor do `--json` por pipe (o subprocess do
+        # teste, um xargs, o Fable no ambiente dele) só recebe EOF quando TODAS as
+        # pontas de escrita fecham — e o pai já saiu, mas este filho-cadáver não.
+        # Resultado: a CLI "some" mas o pipeline pendura > timeout. Cache quente = o
+        # stat volta rapido, o filho fecha a fd, EOF chega (por isso 7/7 limpas);
+        # frio = trava em D segurando o stdout. A cura e fechar TODA fd herdada menos
+        # o `w` do pipe — o unico canal legitimo deste filho. (Tambem protege a GUI:
+        # não segura pipes de subprocessos rg/fd nem o socket do X11.)
         try:
             os.close(r)
         except OSError:
             pass
+        try:                              # /proc/self/fd: barato e exato (como o subprocess)
+            _inherited = [int(e) for e in os.listdir("/proc/self/fd")]
+        except OSError:
+            _inherited = list(range(0, 256))
+        for _fd in _inherited:
+            if _fd == w:
+                continue
+            try:
+                os.close(_fd)
+            except OSError:
+                pass
         code = _PROBE_ALIVE
         try:
             _stat(mp)

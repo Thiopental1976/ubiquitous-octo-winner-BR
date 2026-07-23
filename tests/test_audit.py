@@ -1275,7 +1275,30 @@ def test_search_profile_classification():
     # sob /mnt) não serializa e não é rede.
     root = P("/home/rodrigo/x")
     assert not root.is_network and not root.serialize, "raiz local: nem rede nem serial"
-    print("ok  F9a  search_profile: rede/gvfs/autofs classificados p/ política de busca")
+
+    # R1 (revisão Fable 23/07): classificar um root de REDE NÃO pode tocar o
+    # filesystem no PAI — só string + /proc/mounts (local). Se um os.stat/lstat/
+    # realpath/statvfs escapasse sobre o root, um mount frio/travado penduraria o pai
+    # ANTES do fork da sonda (a sonda nem nasceria). Guard: com esses syscalls
+    # armados p/ EXPLODIR, classificar um mount de rede tem de passar ileso.
+    import os as _os
+    _armados = {}
+    for nome in ("stat", "lstat", "statvfs"):
+        _armados[nome] = getattr(_os, nome)
+    _rp = _os.path.realpath
+    def _boom(*a, **k):
+        raise AssertionError("classificação de rede tocou o filesystem no pai (R1)!")
+    try:
+        for nome in _armados:
+            setattr(_os, nome, _boom)
+        _os.path.realpath = _boom
+        pr = disks.search_profile("/mnt/nas/a.mkv", mounts=M)
+        assert pr.klass == "network" and pr.is_network, "rede deveria classificar FS-free"
+    finally:
+        for nome, fn in _armados.items():
+            setattr(_os, nome, fn)
+        _os.path.realpath = _rp
+    print("ok  F9a  search_profile: rede/gvfs/autofs classificados; rede é FS-free (R1)")
 
 
 def test_mount_alive_watchdog():
@@ -1544,6 +1567,83 @@ def test_indexed_search_coverage_and_staleness():
         # e a cobertura recusa um root podado por caminho e por fstype
         assert indexed.index_coverage("/mnt/x", conf, mounts=[("srv:/e", "/mnt/x", "nfs4")])
         print("ok  F9b  indexed: opt-in, recusa poda, staleness viva, conteúdo barrado")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_probe_child_closes_inherited_fds():
+    """R1 (revisão Fable 23/07): o "hang só na primeira vez" da CLI não era cold-start
+    do FUSE — era o FILHO da sonda (mount_status) segurando as fds herdadas do pai.
+    Preso num stat de mount morto (D-state), ele mantém o stdout do `--json` aberto e
+    um leitor por pipe (o subprocess do teste, um xargs) só recebe EOF quando TODAS as
+    pontas de escrita fecham. O pai já saiu, mas o filho-cadáver não. Prova
+    determinística SEM NAS real: um pipe nosso, um stat lento que segura o filho vivo
+    além do timeout, e a conferência de que o filho FECHOU a ponta de escrita herdada
+    — o read vê EOF na hora, não espera o stat terminar."""
+    import select as _select
+    rp, wp = os.pipe()
+    slow = lambda p: time.sleep(1.5)          # segura o filho vivo além do timeout
+    t0 = time.time()
+    st = disks.mount_status("/qualquer", timeout=0.2, _stat=slow)
+    assert st == "no_response", st
+    os.close(wp)                              # fecha a NOSSA ponta de escrita
+    # se o filho fechou a cópia herdada de wp (fix R1), o pipe não tem mais escritor
+    # => read vê EOF já; se a segurou, bloquearia ~1.5s até o filho sair.
+    ready, _, _ = _select.select([rp], [], [], 0.6)
+    assert ready, "EOF não chegou: o filho da sonda ainda segura a fd herdada (R1)"
+    assert os.read(rp, 1) == b"", "esperado EOF (todas as pontas de escrita fechadas)"
+    assert time.time() - t0 < 1.3, "read pendurou esperando o filho — fd vazou (R1)"
+    os.close(rp)
+    print("ok  R1   sonda: filho fecha fds herdadas (stdout do --json não pendura)")
+
+
+def test_indexed_prunenames_coverage():
+    """R3 (revisão Fable 23/07): PRUNENAMES poda subárvores POR NOME em qualquer
+    profundidade e a cobertura ignorava — o "parcial podado" voltava pela porta dos
+    fundos. Regra com paridade à busca viva: cobertura íntegra SÓ se todos os
+    prunenames são ocultos E a busca não inclui ocultos (aí a busca viva pularia
+    igual). node_modules (visível) ou .git com --hidden (a busca viva desceria) =>
+    recusa."""
+    import indexed
+    base = {"prunepaths": [], "prunefs": set(), "prune_bind": True}
+    M = [("d", "/x", "ext4")]
+    # (a) prunename oculto + busca sem ocultos => coberto (a busca viva pula igual)
+    conf = dict(base, prunenames=[".git"])
+    assert indexed.index_coverage("/x", conf, mounts=M, include_hidden=False) == [], \
+        "prunename oculto sem --hidden deveria ser cobertura íntegra"
+    # (b) o MESMO com --hidden => a busca viva desceria em .git; o índice não => furo
+    assert indexed.index_coverage("/x", conf, mounts=M, include_hidden=True), \
+        "prunename oculto COM --hidden deveria recusar (índice omite .git)"
+    # (c) prunename NÃO-oculto (node_modules) => sempre furo
+    conf2 = dict(base, prunenames=["node_modules"])
+    holes = indexed.index_coverage("/x", conf2, mounts=M, include_hidden=False)
+    assert holes and holes[0]["reason"] == "prunename", holes
+    print("ok  R3   PRUNENAMES: oculto+sem-hidden coberto; visível/--hidden recusa")
+
+
+def test_indexed_symlink_root_translates():
+    """R4 (revisão Fable 23/07): root que É/CONTÉM symlink. O plocate devolve o
+    caminho REAL (resolvido); sem realpath, `_under` jogaria TODOS os candidatos fora
+    do subtree => zero resultados apresentado como 'zero confiável' — mentira. Com o
+    fix: casa no realpath, acha, e DEVOLVE o caminho na forma que o usuário deu (o
+    symlink), pra UI não trocar o caminho dele."""
+    import indexed
+    d = tempfile.mkdtemp(prefix="lfs_sym_")
+    try:
+        realdir = os.path.join(d, "srv_dados")
+        os.makedirs(realdir)
+        open(os.path.join(realdir, "laudo.txt"), "w").close()
+        link = os.path.join(d, "repo")                 # repo -> srv_dados
+        os.symlink(realdir, link)
+        # _run fake: o plocate devolve o caminho REAL (resolvido), como na vida real
+        run = lambda args: os.fsencode(os.path.realpath(link) + "/laudo.txt") + b"\x00"
+        conf_vazia = {"prunepaths": [], "prunefs": set(), "prunenames": [], "prune_bind": True}
+        q = engine.Query(paths=[link], name_patterns=[engine.as_name_glob("laudo")])
+        got = list(indexed.search_indexed(q, conf=conf_vazia, mounts=[], _run=run))
+        assert len(got) == 1, f"symlink deu {len(got)} (esperado 1) — _under jogou fora?"
+        assert got[0].path == os.path.join(link, "laudo.txt"), \
+            f"devolveu {got[0].path!r}, esperado a forma do usuário (o symlink)"
+        print("ok  R4   root symlink: acha via realpath e devolve o caminho do usuário")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2444,6 +2544,10 @@ def main():
            test_cli_emits_bytes_for_hostile_names,
            test_cli_json_and_exit_codes,
            test_indexed_search_coverage_and_staleness,
+           # Revisão Fable 23/07 (4 achados sobre F1/F2/plocate)
+           test_probe_child_closes_inherited_fds,
+           test_indexed_prunenames_coverage,
+           test_indexed_symlink_root_translates,
            test_preflight_flags_fat_problems,
            test_copy_paces_writes_on_removable,
            test_copy_into_itself, test_qt_drag_and_clipboard_payload,

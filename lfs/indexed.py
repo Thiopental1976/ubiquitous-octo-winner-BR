@@ -82,14 +82,15 @@ def _under(child: str, parent: str) -> bool:
     return child.startswith(parent + "/") if parent != "/" else True
 
 
-def index_coverage(root: str, conf: dict, mounts=None) -> list:
+def index_coverage(root: str, conf: dict, mounts=None, include_hidden: bool = False) -> list:
     """Lista dos BURACOS do índice sob `root` (vazio = cobertura íntegra). Cada
-    item: {'path': <subtree podado>, 'reason': 'prunepath'|'prunefs:<fs>'}.
+    item: {'path': <subtree podado>, 'reason': 'prunepath'|'prunefs:<fs>'|'prunename'}.
 
-    Cobre três fontes de poda: (a) o próprio root cai sob um PRUNEPATH; (b) o
+    Cobre quatro fontes de poda: (a) o próprio root cai sob um PRUNEPATH; (b) o
     fstype da montagem do root está em PRUNEFS; (c) qualquer PRUNEPATH ou
     montagem-filha (fstype em PRUNEFS) que mora DENTRO do root — o subtree some
-    do índice. É o que transforma o `--index` de otimista em honesto."""
+    do índice; (d) PRUNENAMES (poda POR NOME em qualquer profundidade — ver R3).
+    É o que transforma o `--index` de otimista em honesto."""
     root = os.path.abspath(root)
     try:
         ents = mounts if mounts is not None else disks._read_mounts()
@@ -113,6 +114,18 @@ def index_coverage(root: str, conf: dict, mounts=None) -> list:
         _d, _mp, mfs = disks._mount_entry(m, ents)
         if mfs.lower() in conf.get("prunefs", set()):
             holes.append({"path": m, "reason": f"prunefs:{mfs}"})
+    # (d) PRUNENAMES (achado R3 do Fable): podam subárvores POR NOME em QUALQUER
+    # profundidade (o clássico é o admin somar 'node_modules'/'.git'). O índice
+    # omitiria esses galhos em silêncio — o mesmo "parcial podado" que a própria
+    # objeção do Fable matou, voltando pela porta dos fundos. Regra SEM walk, com
+    # paridade: se TODOS os prunenames começam com '.' E a busca não inclui ocultos,
+    # a busca VIVA também os pularia (hidden) → cobertura íntegra, sem furo. Qualquer
+    # prunename NÃO-oculto, ou ocultos com --hidden (aí a busca viva DESCERIA neles),
+    # deixa buraco → recusa listando os nomes.
+    pnames = conf.get("prunenames", [])
+    if pnames and not (not include_hidden and all(n.startswith(".") for n in pnames)):
+        for n in pnames:
+            holes.append({"path": n, "reason": "prunename"})
     # dedup preservando ordem
     seen = set(); uniq = []
     for h in holes:
@@ -168,24 +181,33 @@ def search_indexed(q: engine.Query, conf=None, mounts=None,
 
     match_name = engine._name_matcher(q)
     for root in q.paths:
-        root = os.path.abspath(os.path.expanduser(root))
-        holes = index_coverage(root, conf, mounts)
+        given = os.path.abspath(os.path.expanduser(root))
+        # R4 (achado Fable): o plocate indexa e devolve caminhos REAIS (resolvidos).
+        # Se o root É ou CONTÉM symlink (ex.: ~/repositorio -> /srv/dados), casar os
+        # candidatos contra a forma dada os jogaria TODOS fora de _under → zero
+        # resultados apresentado como "zero confiável", uma mentira. Casamos contra o
+        # realpath; a cobertura também roda no real (senão o _mount_entry sobre o
+        # symlink não veria o fstype/poda do alvo verdadeiro). Depois traduzimos o
+        # prefixo de volta p/ `given`, pra UI não trocar o caminho do usuário.
+        real = os.path.realpath(given)
+        holes = index_coverage(real, conf, mounts, include_hidden=q.include_hidden)
         if holes:
             det = ", ".join(f"{h['path']} ({h['reason']})" for h in holes)
             raise IndexError_(
-                f"'{root}' contém partes fora do índice: {det}. O resultado "
+                f"'{given}' contém partes fora do índice: {det}. O resultado "
                 f"indexado omitiria esse subtree em silêncio — use a busca viva.")
-        base_depth = root.rstrip("/").count("/")
+        base_depth = real.rstrip("/").count("/")
         eff_max = 1 if not q.recursive else q.max_depth
+        translate = real != given            # root (ou ancestral) é symlink
         # plocate: casa o root como substring (delimita o subtree); -0 NUL p/ nome
         # com \n; sem -i pra não alargar (o casamento fino é do _name_matcher).
-        out = _run(["-0", "--", root])
+        out = _run(["-0", "--", real])
         for chunk in out.split(b"\x00"):
             if not chunk:
                 continue
             path = os.fsdecode(chunk)          # bytes -> str (surrogateescape)
-            # plocate casa em qualquer lugar do caminho; fixa no subtree do root
-            if not _under(path, root):
+            # plocate casa em qualquer lugar do caminho; fixa no subtree do root real
+            if not _under(path, real):
                 continue
             base = os.path.basename(path)
             if not q.include_hidden and base.startswith("."):
@@ -203,5 +225,7 @@ def search_indexed(q: engine.Query, conf=None, mounts=None,
                 continue                       # sumiu do disco desde o updatedb
             if not engine._passes_meta(q, st):
                 continue
-            yield engine.Match(path=path, size=st.st_size, mtime=st.st_mtime,
+            # R4: devolve na forma que o usuário deu (prefixo real -> given)
+            shown = given + path[len(real):] if translate else path
+            yield engine.Match(path=shown, size=st.st_size, mtime=st.st_mtime,
                                is_dir=os.path.isdir(path))
